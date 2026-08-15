@@ -5,6 +5,39 @@
 // the dish/router from the browser; that's now server.py's job. Every method
 // signature and return type below is unchanged, so no calling component had
 // to change -- only the transport underneath did.
+//
+// The one exception is encodeRequest: it doesn't make a local call at all, it
+// builds the raw protobuf bytes an authenticated host sends through the cloud
+// gateway (see core/routerClientUpdate.ts) -- for that it still needs the
+// schema dumped from the dish's reflection service, loaded lazily so the
+// (much more common) local-only calls above never pay for a fetch they don't
+// need.
+
+import {
+  createFileRegistry,
+  fromBinary,
+  fromJson,
+  toBinary,
+  type DescMessage,
+  type JsonValue,
+  type Registry,
+} from "@bufbuild/protobuf";
+import { FileDescriptorSetSchema } from "@bufbuild/protobuf/wkt";
+
+let requestSchemaPromise: Promise<{ requestSchema: DescMessage; registry: Registry }> | null = null;
+
+function loadRequestSchema(): Promise<{ requestSchema: DescMessage; registry: Registry }> {
+  requestSchemaPromise ??= (async () => {
+    const protosetResponse = await fetch("/dish.protoset");
+    const protosetBytes = new Uint8Array(await protosetResponse.arrayBuffer());
+    const fileDescriptorSet = fromBinary(FileDescriptorSetSchema, protosetBytes);
+    const registry = createFileRegistry(fileDescriptorSet);
+    const requestSchema = registry.getMessage("SpaceX.API.Device.Request");
+    if (!requestSchema) throw new Error("Device Request missing from dish.protoset");
+    return { requestSchema, registry };
+  })();
+  return requestSchemaPromise;
+}
 
 // The FastAPI backend's own address. Same-origin by default (it also serves
 // this app's built static files); override for a dev setup where the two run
@@ -493,11 +526,9 @@ export class DishClient {
 
   /** Encode a Device.Request for an authenticated host to send through the cloud
    *  gateway. This does not perform a local router write. */
-  encodeRequest(requestJson: object): Uint8Array {
-    return toBinary(
-      this.requestSchema,
-      fromJson(this.requestSchema, requestJson as JsonValue, { registry: this.registry }),
-    );
+  async encodeRequest(requestJson: object): Promise<Uint8Array> {
+    const { requestSchema, registry } = await loadRequestSchema();
+    return toBinary(requestSchema, fromJson(requestSchema, requestJson as JsonValue, { registry }));
   }
 
   /** Current dish configuration (sleep schedule, snow melt, update window …). */
