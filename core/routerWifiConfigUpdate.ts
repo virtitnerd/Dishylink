@@ -43,16 +43,21 @@ export type ContentFilteringLevel = 0 | 1 | 2;
  * The writes this module knows how to build. "dns" is the one fully verified
  * live (see this project's own notes on why it went first: most recoverable
  * of the settings dishylink excludes from local writes). "bypassMode" is a
- * single unambiguous boolean, low risk to verify the same way.
+ * single unambiguous boolean -- but the *consequence* of turning it on is
+ * severe (this router's own WiFi drops immediately, recoverable only via a
+ * factory reset from the Starlink app), so the caller must arm a real
+ * confirmation before sending it, not just disable-while-saving.
  * "contentFiltering" additionally overrides any custom DNS the moment it's
  * enabled (confirmed by the account holder against the official app) -- the
  * caller is responsible for surfacing that, this module just builds the
- * request.
+ * request. "ssid" changes a network's name/password/visibility for one band;
+ * see its own note below on why password is required, not optional.
  */
 export type RouterWifiConfigUpdate =
   | { kind: "dns"; nameservers: string[]; disabled: boolean }
   | { kind: "bypassMode"; enabled: boolean }
-  | { kind: "contentFiltering"; level: ContentFilteringLevel; allowDomains?: string[] };
+  | { kind: "contentFiltering"; level: ContentFilteringLevel; allowDomains?: string[] }
+  | { kind: "ssid"; band: string; ssid: string; password: string; hidden?: boolean };
 
 /** Trusted-host preparation, mirroring prepareRouterClientUpdate: source the
  *  target device id directly from the local router immediately before
@@ -89,6 +94,33 @@ export async function prepareRouterWifiConfigUpdate(
       ...(update.allowDomains !== undefined ? { sandboxDomainAllowList: update.allowDomains } : {}),
     }));
     if (networks.length === 0) throw new Error("router has no configured networks to filter");
+    return router.encodeRequest(wifiConfigRequestFor(targetId, { networks }));
+  }
+
+  if (update.kind === "ssid") {
+    // Same read-modify-write, and the same password requirement, as
+    // set_wifi_ssid does locally in starlink_client.py: the router masks
+    // passwords on read ("•••••"), so a write that only wanted to rename the
+    // SSID and left the existing (masked) basicServiceSet untouched would
+    // write the literal string "•••••" as the new password -- locking every
+    // device off the network. Always resupplying the real password removes
+    // the ambiguity; that's why it's required here, not optional.
+    const config = await router.getWifiConfig(AbortSignal.timeout(5_000));
+    let matched = false;
+    const networks = (config.networks ?? []).map((network) => ({
+      ...network,
+      basicServiceSets: (network.basicServiceSets ?? []).map((bss) => {
+        if (bss.band !== update.band) return bss;
+        matched = true;
+        return {
+          ...bss,
+          ssid: update.ssid,
+          authWpa2: { password: update.password },
+          ...(update.hidden !== undefined ? { hidden: update.hidden } : {}),
+        };
+      }),
+    }));
+    if (!matched) throw new Error(`no configured network found for band ${update.band}`);
     return router.encodeRequest(wifiConfigRequestFor(targetId, { networks }));
   }
 

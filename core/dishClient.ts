@@ -278,6 +278,12 @@ export interface WifiBasicServiceSetJson {
   ssid?: string;
   band?: string;
   ifaceName?: string;
+  /** Read back masked ("•••••"), never the real value -- a write must always
+   *  resupply the actual password, never round-trip this. See
+   *  setRouterWifiSsid's own note for why that matters. */
+  authWpa2?: { password?: string };
+  hidden?: boolean;
+  disable?: boolean;
 }
 
 export interface WifiLanNetworkJson {

@@ -30,3 +30,16 @@ export async function setRouterContentFiltering(
 ): Promise<void> {
   await applyRouterWifiConfigUpdate({ kind: "contentFiltering", level, allowDomains });
 }
+
+/** password is required on every call, not optional -- see
+ *  core/routerWifiConfigUpdate.ts's own note on why re-sending the real
+ *  password is what keeps a rename from locking every device off the
+ *  network. */
+export async function setRouterWifiSsid(
+  band: string,
+  ssid: string,
+  password: string,
+  hidden?: boolean,
+): Promise<void> {
+  await applyRouterWifiConfigUpdate({ kind: "ssid", band, ssid, password, hidden });
+}

@@ -18,6 +18,7 @@ import type { RouterUnreachable } from "../../lib/routerDiagnosis";
 import { Badge } from "@/components/ui/badge";
 import {
   DangerAction,
+  DangerToggle,
   SectionLabel,
   SettingRow,
   selectContentClass,
@@ -29,21 +30,29 @@ import {
   setRouterBypassMode,
   setRouterContentFiltering,
   setRouterCustomDns,
+  setRouterWifiSsid,
 } from "../../lib/routerWifiConfigUpdate";
+
+interface BandInfo {
+  /** The literal band value the API needs (RF_2GHZ, ...), not the display label. */
+  raw: string;
+  label: string;
+  hidden: boolean;
+}
 
 /** SSIDs with the bands each is broadcast on. One network can appear on several
  *  radios, so they are folded by name rather than listed once per radio. */
-function ssidsWithBands(wifiConfig: WifiNetworkConfigJson | null): [string, string[]][] {
+function ssidsWithBands(wifiConfig: WifiNetworkConfigJson | null): [string, BandInfo[]][] {
   const sets = wifiConfig?.networks?.flatMap((network) => network.basicServiceSets ?? []) ?? [];
-  const byName = new Map<string, string[]>();
+  const byName = new Map<string, BandInfo[]>();
   for (const set of sets) {
-    if (!set.ssid) continue;
+    if (!set.ssid || !set.band) continue;
     const bands = byName.get(set.ssid) ?? [];
-    if (set.band) {
-      bands.push(
-        set.band.replace("RF_", "").replace("GHZ", " GHz").replace("5 GHz_HIGH", "5 GHz hi"),
-      );
-    }
+    bands.push({
+      raw: set.band,
+      label: set.band.replace("RF_", "").replace("GHZ", " GHz").replace("5 GHz_HIGH", "5 GHz hi"),
+      hidden: Boolean(set.hidden),
+    });
     byName.set(set.ssid, bands);
   }
   return [...byName.entries()];
@@ -100,19 +109,41 @@ export function RouterSettingsTab({
     }
   };
 
-  const [bypassSaving, setBypassSaving] = useState(false);
-  const [bypassResult, setBypassResult] = useState<string | null>(null);
-  const saveBypass = async (enabled: boolean) => {
-    setBypassSaving(true);
-    setBypassResult(null);
+  // One SSID group editable at a time. A rename applies to every band that
+  // SSID currently broadcasts on -- sequential cloud writes, safe because
+  // they share updateWifiConfig's own serialization queue.
+  const [editingSsid, setEditingSsid] = useState<string | null>(null);
+  const [ssidDraft, setSsidDraft] = useState("");
+  const [passwordDraft, setPasswordDraft] = useState("");
+  const [hiddenDraft, setHiddenDraft] = useState(false);
+  const [ssidSaving, setSsidSaving] = useState(false);
+  const [ssidResult, setSsidResult] = useState<string | null>(null);
+
+  const startEditingSsid = (ssid: string, bands: BandInfo[]) => {
+    setEditingSsid(ssid);
+    setSsidDraft(ssid);
+    setPasswordDraft("");
+    setHiddenDraft(bands[0]?.hidden ?? false);
+    setSsidResult(null);
+  };
+
+  const saveSsid = async (bands: BandInfo[]) => {
+    if (!passwordDraft) {
+      setSsidResult("Failed: password is required — the router masks it on read, so it must be resupplied on every write.");
+      return;
+    }
+    setSsidSaving(true);
+    setSsidResult(null);
     try {
-      await setRouterBypassMode(enabled);
-      setBypassResult(enabled ? "Enabled — this router's WiFi will drop shortly." : "Disabled.");
+      for (const band of bands) {
+        await setRouterWifiSsid(band.raw, ssidDraft, passwordDraft, hiddenDraft);
+      }
+      setSsidResult("Saved — the router will pick it up shortly.");
+      setEditingSsid(null);
     } catch (error) {
-      setBypassResult(`Failed: ${(error as Error).message}`);
+      setSsidResult(`Failed: ${(error as Error).message}`);
     } finally {
-      setBypassSaving(false);
-      window.setTimeout(() => setBypassResult(null), 4000);
+      setSsidSaving(false);
     }
   };
 
@@ -150,11 +181,74 @@ export function RouterSettingsTab({
     <>
       <SectionLabel>Networks</SectionLabel>
       {ssids.map(([ssid, bands]) => (
-        <SettingRow key={ssid} title={ssid} caption='WPA2 · password managed in the Starlink app'>
-          {[...new Set(bands)].map((band) => (
-            <Badge key={band}>{band}</Badge>
-          ))}
-        </SettingRow>
+        <div key={ssid}>
+          <SettingRow
+            title={ssid}
+            caption={
+              cloudConnected
+                ? "Rename or re-key this network, written through your connected Starlink account"
+                : "WPA2 · password managed in the Starlink app"
+            }
+            note={editingSsid === ssid ? ssidResult : null}
+          >
+            {[...new Set(bands.map((b) => b.label))].map((label) => (
+              <Badge key={label}>{label}</Badge>
+            ))}
+            {cloudConnected && editingSsid !== ssid && (
+              <button
+                className={actionButton("subtle")}
+                onClick={() => startEditingSsid(ssid, bands)}
+              >
+                Edit
+              </button>
+            )}
+          </SettingRow>
+          {editingSsid === ssid && (
+            <div className='mb-2.5 flex flex-col gap-2 rounded-md border border-hairline bg-[color-mix(in_srgb,var(--ink)_4%,var(--surface))] p-3'>
+              <div className='flex items-center gap-2'>
+                <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>Name</span>
+                <input
+                  type='text'
+                  className='h-7 flex-1 rounded-sm border border-hairline bg-transparent px-2 text-[12px] text-ink hover:border-input'
+                  value={ssidDraft}
+                  disabled={ssidSaving}
+                  onChange={(event) => setSsidDraft(event.target.value)}
+                />
+              </div>
+              <div className='flex items-center gap-2'>
+                <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>Password</span>
+                <input
+                  type='text'
+                  placeholder='required — not read back from the router'
+                  className='h-7 flex-1 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink hover:border-input'
+                  value={passwordDraft}
+                  disabled={ssidSaving}
+                  onChange={(event) => setPasswordDraft(event.target.value)}
+                />
+              </div>
+              <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
+                <Switch checked={hiddenDraft} disabled={ssidSaving} onCheckedChange={setHiddenDraft} />
+                Hide this network
+              </label>
+              <div className='flex items-center gap-2'>
+                <button
+                  className={actionButton("subtle")}
+                  disabled={ssidSaving}
+                  onClick={() => void saveSsid(bands)}
+                >
+                  {ssidSaving ? "Saving…" : "Save"}
+                </button>
+                <button
+                  className={actionButton("subtle")}
+                  disabled={ssidSaving}
+                  onClick={() => setEditingSsid(null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       ))}
 
       {meshNodes.length > 0 && (
@@ -201,17 +295,19 @@ export function RouterSettingsTab({
           : "Confirmed blocked on current firmware (Permission denied on every local write RPC). Connect your Starlink account in the App tab to write these through the cloud instead."}
       </Callout>
 
-      <SettingRow
+      <DangerToggle
         title='Bypass mode'
-        caption="Disables this router's own WiFi for a third-party router on its ethernet port -- WiFi drops the moment this is enabled"
-        note={bypassResult}
-      >
-        <Switch
-          checked={Boolean(wifiConfig.bypassMode)}
-          disabled={!cloudConnected || bypassSaving}
-          onCheckedChange={(enabled) => void saveBypass(enabled)}
-        />
-      </SettingRow>
+        caption="Disables this router's own WiFi for a third-party router on its ethernet port"
+        checked={Boolean(wifiConfig.bypassMode)}
+        disabled={!cloudConnected}
+        dangerousWhen={true}
+        warning="This will disconnect this router's own WiFi immediately, including whatever you're using to reach it right now. There's no local undo -- recovery needs a factory reset from the Starlink app itself. Only continue if a third-party router is already wired in and ready to take over."
+        confirmLabel='Yes, enable bypass mode'
+        onConfirm={async (enabled) => {
+          await setRouterBypassMode(enabled);
+          return enabled ? "Enabled — this router's WiFi will drop shortly." : "Disabled.";
+        }}
+      />
 
       <SettingRow
         title='Custom DNS'

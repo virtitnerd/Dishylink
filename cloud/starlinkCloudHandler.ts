@@ -461,6 +461,19 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
             update.allowDomains.length <= 64 &&
             update.allowDomains.every((d) => typeof d === "string" && d.length <= 255)))
       );
+    if (update?.kind === "ssid")
+      return (
+        typeof update.band === "string" &&
+        update.band.length > 0 &&
+        typeof update.ssid === "string" &&
+        update.ssid.length > 0 &&
+        update.ssid.length <= 32 &&
+        // Required, not optional -- see routerWifiConfigUpdate.ts's own note:
+        // an absent password would round-trip the router's read-back mask.
+        typeof update.password === "string" &&
+        update.password.length > 0 &&
+        (update.hidden === undefined || typeof update.hidden === "boolean")
+      );
     return false;
   }
 
