@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from historian import Historian, JsonlSink, downsample
 from starlink_client import StarlinkError, get_client
+import webhook
 
 
 def safe(fn):
@@ -76,8 +77,18 @@ def collect_sample() -> dict:
     return row
 
 
+def collect_sample_and_notify() -> dict:
+    """The historian's own collect_fn -- collect_sample() plus the webhook
+    side effect. Kept separate from collect_sample() itself, which /metrics
+    also calls directly: an external Prometheus scraper polling independently
+    of the historian must not also drive (and fight over) webhook state."""
+    row = collect_sample()
+    webhook.check_transitions(row)
+    return row
+
+
 sink = JsonlSink()
-historian = Historian(collect_sample, [sink])
+historian = Historian(collect_sample_and_notify, [sink])
 
 
 @asynccontextmanager
@@ -560,20 +571,49 @@ class WebhookPayload(BaseModel):
 
 @app.post("/api/notify-webhook")
 def api_notify_webhook(payload: WebhookPayload):
-    """Relays an alert to a user-configured webhook URL server-side to avoid browser CORS issues."""
-    scheme = urllib.parse.urlsplit(payload.url).scheme
-    if scheme not in ("http", "https"):
-        return JSONResponse({"ok": False, "error": "webhook URL must be http:// or https://"})
+    """One-off relay to an arbitrary URL, server-side to avoid browser CORS issues.
+    Doesn't touch the stored config below -- for automatic alert notifications, see
+    /api/settings/webhook instead."""
+    error = webhook.validate_url(payload.url)
+    if error:
+        return JSONResponse({"ok": False, "error": error})
+    return JSONResponse(webhook.send(payload.url, payload.title, payload.body))
 
-    message = f"{payload.title}: {payload.body}"
-    # Covers Slack ("text"), Discord ("content"), and generic JSON receivers ("title"/"message") in one POST.
-    data = json.dumps({"text": message, "content": message, "title": payload.title, "message": payload.body}).encode("utf-8")
-    req = urllib.request.Request(payload.url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            return JSONResponse({"ok": True, "status": resp.status})
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
-        return JSONResponse({"ok": False, "error": str(exc)})
+
+class WebhookConfigPayload(BaseModel):
+    url: str
+    enabled: bool
+
+
+@app.get("/api/settings/webhook")
+def api_get_webhook_config():
+    """Current webhook config -- read by the settings UI to show what's saved."""
+    return JSONResponse({"ok": True, "data": webhook.read_config()})
+
+
+@app.post("/api/settings/webhook")
+def api_set_webhook_config(payload: WebhookConfigPayload):
+    """Saves the webhook URL and whether automatic alert notifications are on.
+    Once enabled, the historian's own poll loop fires this on every alert
+    transition (see webhook.py) -- no browser tab has to be open."""
+    if payload.enabled and payload.url:
+        error = webhook.validate_url(payload.url)
+        if error:
+            return JSONResponse({"ok": False, "error": error})
+    return JSONResponse({"ok": True, "data": webhook.write_config(payload.url, payload.enabled)})
+
+
+@app.post("/api/settings/webhook/test")
+def api_test_webhook_config():
+    """Sends a sample notification to the currently-saved webhook URL, so the
+    settings UI can offer a "send test" button without needing the URL passed
+    in again (it might be masked/already-saved-only in the UI)."""
+    config = webhook.read_config()
+    if not config.get("url"):
+        return JSONResponse({"ok": False, "error": "no webhook URL saved yet"})
+    return JSONResponse(
+        webhook.send(config["url"], "Dishylink test", "This is a test notification from your Starlink dashboard.")
+    )
 
 
 @app.websocket("/ws/live")

@@ -9,6 +9,7 @@
 
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Switch } from "@/components/ui/switch";
+import { actionButton } from "@/components/ui/action-button";
 import {
   Select,
   SelectContent,
@@ -16,13 +17,84 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SettingRow, selectContentClass, selectItemClass, triggerClass } from "./settingsChrome";
+import { SectionLabel, SettingRow, selectContentClass, selectItemClass, triggerClass } from "./settingsChrome";
 import {
   readToolbarStyle,
   setToolbarStyle,
   subscribeToToolbarStyle,
   type ToolbarStyle,
 } from "../../lib/toolbarStyle";
+import { apiRequest } from "../../lib/apiHost";
+
+interface WebhookConfig {
+  url: string;
+  enabled: boolean;
+}
+
+/**
+ * Fires server-side, from the historian's own poll loop (see backend/webhook.py)
+ * -- not "the browser noticed an alert and called a relay endpoint", which is
+ * this project's own earlier approach and only works while a tab is open. A
+ * webhook's whole point is to reach you when you're *not* looking at the page.
+ */
+function useWebhookSettings() {
+  const [config, setConfig] = useState<WebhookConfig | null>(null);
+  const [draftUrl, setDraftUrl] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [testState, setTestState] = useState<"idle" | "sending" | "sent" | "failed">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void apiRequest("/api/settings/webhook")
+      .then((res) => res.json())
+      .then((payload: { ok: boolean; data?: WebhookConfig }) => {
+        if (cancelled || !payload.ok || !payload.data) return;
+        setConfig(payload.data);
+        setDraftUrl(payload.data.url);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const save = async (patch: Partial<WebhookConfig>) => {
+    const next = { url: draftUrl, enabled: Boolean(config?.enabled), ...config, ...patch };
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await apiRequest("/api/settings/webhook", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+      const payload = (await res.json()) as { ok: boolean; data?: WebhookConfig; error?: string };
+      if (!payload.ok) {
+        setError(payload.error ?? "failed to save");
+        return;
+      }
+      setConfig(payload.data ?? null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const sendTest = async () => {
+    setTestState("sending");
+    try {
+      const res = await apiRequest("/api/settings/webhook/test", { method: "POST" });
+      const payload = (await res.json()) as { ok: boolean };
+      setTestState(payload.ok ? "sent" : "failed");
+    } catch {
+      setTestState("failed");
+    } finally {
+      window.setTimeout(() => setTestState("idle"), 2500);
+    }
+  };
+
+  return { config, draftUrl, setDraftUrl, saving, error, save, testState, sendTest };
+}
 
 /** The desktop host's throughput-readout bridge, exposed only in the macOS and
  *  Windows desktop apps (the preload gates it on those platforms). Null everywhere
@@ -67,6 +139,7 @@ function useMenuBarThroughput(): [boolean, (on: boolean) => void] | null {
 export function AppSettingsTab() {
   const toolbarStyle = useSyncExternalStore(subscribeToToolbarStyle, readToolbarStyle);
   const menuBar = useMenuBarThroughput();
+  const webhook = useWebhookSettings();
   // The readout lives in the menu bar on macOS and the taskbar on Windows; name
   // whichever this host is. Only reached when the bridge is present, i.e. desktop.
   const surface = window.dishlink?.platform === "win32" ? "taskbar" : "menu bar";
@@ -100,6 +173,45 @@ export function AppSettingsTab() {
           <Switch checked={menuBar[0]} onCheckedChange={menuBar[1]} />
         </SettingRow>
       )}
+
+      <SectionLabel>Webhook notifications</SectionLabel>
+      <SettingRow
+        title='Enabled'
+        caption='Fires from the backend itself on every alert transition -- works even with no browser tab open'
+      >
+        <Switch
+          checked={Boolean(webhook.config?.enabled)}
+          disabled={webhook.saving || !webhook.draftUrl}
+          onCheckedChange={(enabled) => void webhook.save({ enabled })}
+        />
+      </SettingRow>
+      <div className='flex items-center gap-2 pb-[8px]'>
+        <input
+          type='text'
+          placeholder='https://hooks.slack.com/... or a Discord/generic JSON webhook URL'
+          className='h-7 flex-1 rounded-sm border border-hairline bg-transparent px-2 text-[12px] text-ink hover:border-input'
+          value={webhook.draftUrl}
+          disabled={webhook.saving}
+          onChange={(event) => webhook.setDraftUrl(event.target.value)}
+          onBlur={() => {
+            if (webhook.draftUrl !== webhook.config?.url) void webhook.save({ url: webhook.draftUrl });
+          }}
+        />
+        <button
+          className={actionButton("subtle")}
+          disabled={webhook.testState === "sending" || !webhook.config?.url}
+          onClick={() => void webhook.sendTest()}
+        >
+          {webhook.testState === "sending"
+            ? "Sending…"
+            : webhook.testState === "sent"
+              ? "Sent ✓"
+              : webhook.testState === "failed"
+                ? "Failed"
+                : "Send test"}
+        </button>
+      </div>
+      {webhook.error && <div className='pb-[8px] text-[12px] text-destructive'>{webhook.error}</div>}
     </>
   );
 }
