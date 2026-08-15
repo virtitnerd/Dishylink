@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 import client_totals
 import obstruction_snapshots
+import starlink_cloud
 import usage_energy
 from historian import Historian, JsonlSink, downsample
 from starlink_client import StarlinkError, get_client
@@ -761,6 +762,63 @@ class ContentFilteringPayload(BaseModel):
 def api_set_content_filtering(payload: ContentFilteringPayload):
     client = get_client()
     return JSONResponse(safe(lambda: client.set_content_filtering(payload.band, payload.sandbox_enabled, payload.allow_domains)))
+
+
+# -- Starlink cloud (account session, reads, and every device write) --------
+# See starlink_cloud.py's own module docstring: this is what makes the
+# packaged/Docker image single-port -- the frontend already assumes /cloud/*
+# is same-origin (lib/cloudHost.ts's sameOriginTransport).
+
+class CloudSessionPayload(BaseModel):
+    cookie: str
+
+
+@app.post("/cloud/session")
+def api_cloud_connect(payload: CloudSessionPayload):
+    status, body = starlink_cloud.connect(payload.cookie)
+    return JSONResponse(body, status_code=status)
+
+
+@app.delete("/cloud/session")
+def api_cloud_disconnect():
+    status, body = starlink_cloud.disconnect()
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/cloud/account")
+def api_cloud_account():
+    status, body = starlink_cloud.handle("/cloud/account")
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/cloud/usage")
+def api_cloud_usage():
+    status, body = starlink_cloud.handle("/cloud/usage")
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/cloud/telemetry")
+def api_cloud_telemetry():
+    status, body = starlink_cloud.handle("/cloud/telemetry")
+    return JSONResponse(body, status_code=status)
+
+
+@app.post("/cloud/device")
+def api_cloud_device(update: dict[str, Any]):
+    status, body = starlink_cloud.update_client(update)
+    return JSONResponse(body, status_code=status)
+
+
+@app.post("/cloud/wifi-config")
+def api_cloud_wifi_config(update: dict[str, Any]):
+    status, body = starlink_cloud.update_wifi_config(update)
+    return JSONResponse(body, status_code=status)
+
+
+@app.post("/cloud/dish-config")
+def api_cloud_dish_config(update: dict[str, Any]):
+    status, body = starlink_cloud.update_dish_config(update)
+    return JSONResponse(body, status_code=status)
 
 
 class WebhookPayload(BaseModel):

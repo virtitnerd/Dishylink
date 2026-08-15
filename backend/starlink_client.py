@@ -127,6 +127,15 @@ class StarlinkClient:
         assert self._pool is not None
         return self._message_class(self._pool, full_name)
 
+    def new_request_message(self):
+        """An empty Request message, ready for json_format.ParseDict -- what
+        starlink_cloud.py builds cloud (Device.Handle) writes from. Device.Request
+        is the same schema whether the call goes to the dish, the router, or
+        Starlink's cloud gateway, so this reuses whatever schema this client
+        already pulled via reflection rather than fetching it twice."""
+        self._ensure_ready()
+        return self._request_cls()
+
     # -- RPC plumbing ----------------------------------------------------------
 
     def _handle(self, request_field: str, request_type: str | None = None, **kwargs) -> Any:
