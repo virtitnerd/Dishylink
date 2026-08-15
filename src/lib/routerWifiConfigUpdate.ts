@@ -1,6 +1,8 @@
 import { cloudRequest, type CloudRequest, type CloudReply } from "./cloudHost";
-import type { RouterWifiConfigUpdate } from "@core/routerWifiConfigUpdate";
+import type { NetworkMode, RouterWifiConfigUpdate } from "@core/routerWifiConfigUpdate";
 import { AccountRequiredError } from "./routerClientUpdate";
+
+export { SUBNET_OPTIONS, networkModeOf, type NetworkMode } from "@core/routerWifiConfigUpdate";
 
 /** Send one WifiConfig update through Starlink cloud. Mirrors
  *  applyRouterClientUpdate in routerClientUpdate.ts -- see that file for the
@@ -36,10 +38,40 @@ export async function setRouterContentFiltering(
  *  password is what keeps a rename from locking every device off the
  *  network. */
 export async function setRouterWifiSsid(
+  networkDomain: string,
   band: string,
   ssid: string,
   password: string,
   hidden?: boolean,
 ): Promise<void> {
-  await applyRouterWifiConfigUpdate({ kind: "ssid", band, ssid, password, hidden });
+  await applyRouterWifiConfigUpdate({ kind: "ssid", networkDomain, band, ssid, password, hidden });
+}
+
+export async function setRouterNetworkSettings(
+  networkDomain: string,
+  changes: {
+    mode?: NetworkMode;
+    ipv4?: string;
+    dhcpv4Start?: number;
+    dhcpv4End?: number;
+    dhcpv4LeaseDurationS?: number;
+    dhcpDisabled?: boolean;
+    dnsDisabled?: boolean;
+  },
+): Promise<void> {
+  await applyRouterWifiConfigUpdate({ kind: "networkSettings", networkDomain, ...changes });
+}
+
+export async function addRouterNetwork(
+  ssid: string,
+  password: string,
+  ipv4: string,
+  mode: NetworkMode,
+  hidden?: boolean,
+): Promise<void> {
+  await applyRouterWifiConfigUpdate({ kind: "addNetwork", ssid, password, ipv4, mode, hidden });
+}
+
+export async function deleteRouterNetwork(networkDomain: string): Promise<void> {
+  await applyRouterWifiConfigUpdate({ kind: "deleteNetwork", networkDomain });
 }

@@ -289,6 +289,7 @@ export interface WifiBasicServiceSetJson {
 export interface WifiLanNetworkJson {
   ipv4?: string;
   domain?: string;
+  vlan?: number;
   basicServiceSets?: WifiBasicServiceSetJson[];
   /** Content filtering (the official app's term) is "sandbox" in this schema.
    *  sandboxId is the official app's 3-way level -- see
@@ -298,6 +299,20 @@ export interface WifiLanNetworkJson {
   sandboxEnabled?: boolean;
   sandboxId?: number;
   sandboxDomainAllowList?: string[];
+  /** The official app's "Network mode" is a preset over these three fields --
+   *  see NetworkMode in routerWifiConfigUpdate.ts for the exact combination
+   *  each of Default/Guest/Auto sets, and which part of that is confirmed
+   *  live vs inferred. */
+  guest?: boolean;
+  clientIsolation?: boolean;
+  disableWhenOffline?: boolean;
+  /** DHCP range/lease -- not exposed in the official app at all; offered here
+   *  as an advanced option since the schema supports it. */
+  dhcpv4Start?: number;
+  dhcpv4End?: number;
+  dhcpv4LeaseDurationS?: number;
+  dhcpDisabled?: boolean;
+  dnsDisabled?: boolean;
 }
 
 /** A mesh node the router has been paired with, keyed in `meshConfigs` by the

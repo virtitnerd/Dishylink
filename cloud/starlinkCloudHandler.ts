@@ -9,7 +9,9 @@
 
 import { GrpcWebError, grpcWebUnaryCall } from "../core/grpcWeb";
 import type { RouterClientUpdate } from "../core/routerClientUpdate";
-import type { RouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate";
+import { SUBNET_OPTIONS, type NetworkMode, type RouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate";
+
+const VALID_NETWORK_MODES: ReadonlySet<NetworkMode> = new Set(["default", "guest", "auto"]);
 
 const AUTH_URL = "https://api.starlink.com/auth-rp/auth/user";
 const API = "https://starlink.com/api";
@@ -463,6 +465,8 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
       );
     if (update?.kind === "ssid")
       return (
+        typeof update.networkDomain === "string" &&
+        update.networkDomain.length > 0 &&
         typeof update.band === "string" &&
         update.band.length > 0 &&
         typeof update.ssid === "string" &&
@@ -474,6 +478,38 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
         update.password.length > 0 &&
         (update.hidden === undefined || typeof update.hidden === "boolean")
       );
+    if (update?.kind === "networkSettings")
+      return (
+        typeof update.networkDomain === "string" &&
+        update.networkDomain.length > 0 &&
+        (update.mode === undefined || VALID_NETWORK_MODES.has(update.mode)) &&
+        (update.ipv4 === undefined || (SUBNET_OPTIONS as readonly string[]).includes(update.ipv4)) &&
+        (update.dhcpv4Start === undefined ||
+          (Number.isInteger(update.dhcpv4Start) &&
+            update.dhcpv4Start >= 2 &&
+            update.dhcpv4Start <= 254)) &&
+        (update.dhcpv4End === undefined ||
+          (Number.isInteger(update.dhcpv4End) && update.dhcpv4End >= 2 && update.dhcpv4End <= 254)) &&
+        (update.dhcpv4LeaseDurationS === undefined ||
+          (Number.isInteger(update.dhcpv4LeaseDurationS) &&
+            update.dhcpv4LeaseDurationS > 0 &&
+            update.dhcpv4LeaseDurationS <= 30 * 86400)) &&
+        (update.dhcpDisabled === undefined || typeof update.dhcpDisabled === "boolean") &&
+        (update.dnsDisabled === undefined || typeof update.dnsDisabled === "boolean")
+      );
+    if (update?.kind === "addNetwork")
+      return (
+        typeof update.ssid === "string" &&
+        update.ssid.length > 0 &&
+        update.ssid.length <= 32 &&
+        typeof update.password === "string" &&
+        update.password.length > 0 &&
+        (SUBNET_OPTIONS as readonly string[]).includes(update.ipv4) &&
+        VALID_NETWORK_MODES.has(update.mode) &&
+        (update.hidden === undefined || typeof update.hidden === "boolean")
+      );
+    if (update?.kind === "deleteNetwork")
+      return typeof update.networkDomain === "string" && update.networkDomain.length > 0;
     return false;
   }
 
