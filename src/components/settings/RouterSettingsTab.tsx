@@ -13,7 +13,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { DishClient, type WifiLanNetworkJson, type WifiNetworkConfigJson } from "@core/dishClient";
+import {
+  DishClient,
+  type HtBandwidth,
+  type TxPowerLevel,
+  type VhtBandwidth,
+  type WifiBasicServiceSetJson,
+  type WifiLanNetworkJson,
+  type WifiNetworkConfigJson,
+  type WifiSecurityType,
+  type WirelessMode,
+} from "@core/dishClient";
 import type { RouterUnreachable } from "../../lib/routerDiagnosis";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -31,6 +41,8 @@ import {
   addRouterNetwork,
   deleteRouterNetwork,
   networkModeOf,
+  setMeshNodeTrust,
+  setRouterAdvanced,
   setRouterBypassMode,
   setRouterContentFiltering,
   setRouterCustomDns,
@@ -57,6 +69,57 @@ const FILTERING_LABEL: Record<0 | 1 | 2, string> = {
   2: "Malware and adult content",
 };
 
+const SECURITY_LABEL: Record<WifiSecurityType, string> = {
+  wpa2: "WPA2",
+  wpa3: "WPA3",
+  wpa2wpa3: "WPA2/WPA3",
+  open: "Open (no password)",
+};
+const SECURITY_OPTIONS = Object.keys(SECURITY_LABEL) as WifiSecurityType[];
+
+const TX_POWER_LABEL: Record<TxPowerLevel, string> = {
+  TX_POWER_LEVEL_100: "100%",
+  TX_POWER_LEVEL_80: "80%",
+  TX_POWER_LEVEL_50: "50%",
+  TX_POWER_LEVEL_25: "25%",
+  TX_POWER_LEVEL_12: "12%",
+  TX_POWER_LEVEL_6: "6%",
+};
+const TX_POWER_OPTIONS = Object.keys(TX_POWER_LABEL) as TxPowerLevel[];
+
+const WIRELESS_MODE_LABEL: Record<WirelessMode, string> = {
+  WIRELESS_MODE_DEFAULT: "Auto",
+  A_ONLY: "802.11a only",
+  B_ONLY: "802.11b only",
+  G_ONLY: "802.11g only",
+  N_ONLY: "802.11n only",
+  B_G_MIXED: "802.11 b/g",
+  A_N_MIXED: "802.11 a/n",
+  G_N_MIXED: "802.11 g/n",
+  B_G_N_MIXED: "802.11 b/g/n",
+  A_AN_AC_MIXED: "802.11 a/n/ac",
+  AN_AC_MIXED: "802.11 n/ac",
+  B_G_N_AX_MIXED: "802.11 b/g/n/ax",
+  A_AN_AC_AX_MIXED: "802.11 a/n/ac/ax",
+};
+const WIRELESS_MODE_OPTIONS = Object.keys(WIRELESS_MODE_LABEL) as WirelessMode[];
+
+const HT_BANDWIDTH_LABEL: Record<HtBandwidth, string> = {
+  HT_BANDWIDTH_DEFAULT: "Auto",
+  HT_BANDWIDTH_20_MHZ: "20 MHz",
+  HT_BANDWIDTH_20_OR_40_MHZ: "20/40 MHz",
+};
+const HT_BANDWIDTH_OPTIONS = Object.keys(HT_BANDWIDTH_LABEL) as HtBandwidth[];
+
+const VHT_BANDWIDTH_LABEL: Record<VhtBandwidth, string> = {
+  VHT_BANDWIDTH_DEFAULT: "Auto",
+  VHT_BANDWIDTH_DISABLED: "Off",
+  VHT_BANDWIDTH_80_MHZ: "80 MHz",
+  VHT_BANDWIDTH_160_MHZ: "160 MHz",
+  VHT_BANDWIDTH_80_PLUS_80_MHZ: "80+80 MHz",
+};
+const VHT_BANDWIDTH_OPTIONS = Object.keys(VHT_BANDWIDTH_LABEL) as VhtBandwidth[];
+
 /** One row per configured network (not per SSID name -- two networks could
  *  share a name, and mode/subnet/delete are all per-network). Bands come
  *  straight off basicServiceSets, in whatever order the router reports them. */
@@ -64,14 +127,61 @@ function networksOf(wifiConfig: WifiNetworkConfigJson | null): WifiLanNetworkJso
   return wifiConfig?.networks ?? [];
 }
 
+/** Which auth_* sub-message is present tells the band's current security type
+ *  -- absent everything reads as WPA2, since that's this schema's zero value. */
+function securityOf(bss: WifiBasicServiceSetJson | undefined): WifiSecurityType {
+  if (!bss) return "wpa2";
+  if (bss.authWpa3) return "wpa3";
+  if (bss.authWpa2Wpa3) return "wpa2wpa3";
+  if (bss.authOpen) return "open";
+  return "wpa2";
+}
+
+/** "domain,domain=addr,addr" per line -- a plain-text editor for the two DNS
+ *  override lists and static routes, since a full add/remove-row UI for a
+ *  handful of rarely-touched entries isn't worth the extra state machinery. */
+function parseEntryPairs(text: string): { left: string[]; right: string[] }[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [left, right] = line.split("=");
+      return {
+        left: (left ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+        right: (right ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+      };
+    })
+    .filter((e) => e.left.length > 0 && e.right.length > 0);
+}
+
+function parseRoutePairs(text: string): { subnet: string; gateway: string }[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [subnet, gateway] = line.split("=").map((s) => s.trim());
+      return { subnet: subnet ?? "", gateway: gateway ?? "" };
+    })
+    .filter((r) => r.subnet && r.gateway);
+}
+
 /** Edit form state for one network, seeded from its current config. */
 function draftFrom(network: WifiLanNetworkJson) {
   const bands = network.basicServiceSets ?? [];
   const primary = bands[0];
   const split = new Set(bands.map((b) => b.ssid)).size > 1;
-  const perBand: Record<string, { ssid: string; password: string }> = {};
+  const perBand: Record<string, { ssid: string; password: string; disable: boolean; security: WifiSecurityType }> =
+    {};
   for (const b of bands) {
-    if (b.band) perBand[b.band] = { ssid: b.ssid ?? "", password: "" };
+    if (b.band)
+      perBand[b.band] = {
+        ssid: b.ssid ?? "",
+        password: "",
+        disable: Boolean(b.disable),
+        security: securityOf(b),
+      };
   }
   return {
     ssid: primary?.ssid ?? "",
@@ -87,6 +197,13 @@ function draftFrom(network: WifiLanNetworkJson) {
     dhcpv4LeaseDurationS: String(network.dhcpv4LeaseDurationS ?? 3600),
     dhcpDisabled: Boolean(network.dhcpDisabled),
     dnsDisabled: Boolean(network.dnsDisabled),
+    dnsStaticEntriesText: (network.dnsStaticEntries ?? [])
+      .map((e) => `${(e.domains ?? []).join(",")}=${(e.addresses ?? []).join(",")}`)
+      .join("\n"),
+    dnsForwardRulesText: (network.dnsForwardRules ?? [])
+      .map((e) => `${(e.domains ?? []).join(",")}=${(e.serverAddresses ?? []).join(",")}`)
+      .join("\n"),
+    staticRoutesText: (network.staticRoutes ?? []).map((r) => `${r.subnet ?? ""}=${r.gateway ?? ""}`).join("\n"),
   };
 }
 type NetworkDraft = ReturnType<typeof draftFrom>;
@@ -102,7 +219,7 @@ export function RouterSettingsTab({
   unreachable: RouterUnreachable | null;
 }) {
   const networks = useMemo(() => networksOf(wifiConfig), [wifiConfig]);
-  const meshNodes = Object.values(wifiConfig?.meshConfigs ?? {});
+  const meshNodes = Object.entries(wifiConfig?.meshConfigs ?? {});
 
   // Everything in this file past Mesh nodes / Router firmware writes through
   // Starlink's cloud gateway instead of the (confirmed blocked) local RPC --
@@ -125,8 +242,16 @@ export function RouterSettingsTab({
   const saveNetwork = async (network: WifiLanNetworkJson) => {
     if (!draft || !network.domain) return;
     const bands = network.basicServiceSets ?? [];
-    if ((!draft.split && !draft.password) || (draft.split && bands.some((b) => b.band && !draft.perBand[b.band]?.password))) {
-      setResult("Failed: password is required — the router masks it on read, so it must be resupplied on every write.");
+    const passwordFor = (band: string) => (draft.split ? draft.perBand[band]?.password : draft.password);
+    const missingPassword = bands.some((b) => {
+      if (!b.band) return false;
+      const security = draft.perBand[b.band]?.security ?? "wpa2";
+      return security !== "open" && !passwordFor(b.band);
+    });
+    if (missingPassword) {
+      setResult(
+        "Failed: password is required for every secured band — the router masks it on read, so it must be resupplied on every write.",
+      );
       return;
     }
     setSaving(true);
@@ -134,8 +259,14 @@ export function RouterSettingsTab({
     try {
       for (const bss of bands) {
         if (!bss.band) continue;
-        const { ssid, password } = draft.split ? draft.perBand[bss.band] : { ssid: draft.ssid, password: draft.password };
-        await setRouterWifiSsid(network.domain, bss.band, ssid, password, draft.hidden);
+        const perBand = draft.perBand[bss.band];
+        const ssid = draft.split ? (perBand?.ssid ?? "") : draft.ssid;
+        const password = draft.split ? (perBand?.password ?? "") : draft.password;
+        await setRouterWifiSsid(network.domain, bss.band, ssid, password, {
+          hidden: draft.hidden,
+          disable: perBand?.disable,
+          security: perBand?.security,
+        });
       }
       await setRouterNetworkSettings(network.domain, {
         mode: draft.mode,
@@ -145,6 +276,15 @@ export function RouterSettingsTab({
         dhcpv4LeaseDurationS: Number(draft.dhcpv4LeaseDurationS),
         dhcpDisabled: draft.dhcpDisabled,
         dnsDisabled: draft.dnsDisabled,
+        dnsStaticEntries: parseEntryPairs(draft.dnsStaticEntriesText).map((e) => ({
+          domains: e.left,
+          addresses: e.right,
+        })),
+        dnsForwardRules: parseEntryPairs(draft.dnsForwardRulesText).map((e) => ({
+          domains: e.left,
+          serverAddresses: e.right,
+        })),
+        staticRoutes: parseRoutePairs(draft.staticRoutesText),
       });
       setResult("Saved — the router will pick it up shortly.");
       setEditingDomain(null);
@@ -193,11 +333,16 @@ export function RouterSettingsTab({
   const filteringLevel = (wifiConfig?.networks?.[0]?.sandboxId ?? 0) as 0 | 1 | 2;
   const [filteringSaving, setFilteringSaving] = useState(false);
   const [filteringResult, setFilteringResult] = useState<string | null>(null);
-  const saveFiltering = async (level: 0 | 1 | 2) => {
+  const [allowDomainsDraft, setAllowDomainsDraft] = useState("");
+  useMemo(
+    () => setAllowDomainsDraft((wifiConfig?.networks?.[0]?.sandboxDomainAllowList ?? []).join(", ")),
+    [wifiConfig?.networks],
+  );
+  const saveFiltering = async (level: 0 | 1 | 2, allowDomains?: string[]) => {
     setFilteringSaving(true);
     setFilteringResult(null);
     try {
-      await setRouterContentFiltering(level);
+      await setRouterContentFiltering(level, allowDomains);
       setFilteringResult(
         level === 0
           ? "Cleared."
@@ -227,6 +372,46 @@ export function RouterSettingsTab({
     } finally {
       setDnsSaving(false);
       window.setTimeout(() => setDnsResult(null), 4000);
+    }
+  };
+
+  // Every radio/onboarding control below fires its own write immediately on
+  // change (no separate edit-then-save step -- there's nothing to batch, each
+  // is a single flat WifiConfig field), sharing one busy/result pair keyed by
+  // field name the same way StarlinkSettingsTab's dish controls do.
+  const [radioBusy, setRadioBusy] = useState(false);
+  const [radioResult, setRadioResult] = useState<{ field: string; message: string } | null>(null);
+  const radioNoteFor = (field: string) => (radioResult?.field === field ? radioResult.message : undefined);
+  const saveRadio = (field: string, patch: Parameters<typeof setRouterAdvanced>[0]) => {
+    setRadioBusy(true);
+    setRadioResult(null);
+    void setRouterAdvanced(patch)
+      .then(() => setRadioResult({ field, message: "Saved — the router will pick it up shortly." }))
+      .catch((error) => setRadioResult({ field, message: `Failed: ${(error as Error).message}` }))
+      .finally(() => {
+        setRadioBusy(false);
+        window.setTimeout(() => setRadioResult((r) => (r?.field === field ? null : r)), 4000);
+      });
+  };
+  const radioDisabled = radioBusy || !cloudConnected;
+
+  const [channelDrafts, setChannelDrafts] = useState<Record<string, string>>({});
+  const channelValue = (field: "channel2ghz" | "channel5ghz" | "channel5ghzHigh") =>
+    channelDrafts[field] ?? String(wifiConfig?.[field] ?? "");
+
+  const [meshBusyId, setMeshBusyId] = useState<string | null>(null);
+  const [meshResult, setMeshResult] = useState<{ id: string; message: string } | null>(null);
+  const toggleMeshTrust = async (deviceId: string, trusted: boolean) => {
+    setMeshBusyId(deviceId);
+    setMeshResult(null);
+    try {
+      await setMeshNodeTrust(deviceId, trusted);
+      setMeshResult({ id: deviceId, message: trusted ? "Trusted." : "Untrusted." });
+    } catch (error) {
+      setMeshResult({ id: deviceId, message: `Failed: ${(error as Error).message}` });
+    } finally {
+      setMeshBusyId(null);
+      window.setTimeout(() => setMeshResult((r) => (r?.id === deviceId ? null : r)), 4000);
     }
   };
 
@@ -347,6 +532,60 @@ export function RouterSettingsTab({
                   )
                 )}
 
+                {/* Security type and per-band disable, independent of the
+                    split-name choice above -- the schema carries both on each
+                    BasicServiceSet regardless of whether its name is shared. */}
+                {bands.map(
+                  (bss) =>
+                    bss.band && (
+                      <div key={`sec-${bss.band}`} className='flex items-center gap-2'>
+                        <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>
+                          {BAND_LABEL[bss.band] ?? bss.band}
+                        </span>
+                        <Select
+                          value={draft.perBand[bss.band]?.security ?? "wpa2"}
+                          disabled={saving}
+                          onValueChange={(security) =>
+                            setDraft({
+                              ...draft,
+                              perBand: {
+                                ...draft.perBand,
+                                [bss.band!]: {
+                                  ...draft.perBand[bss.band!],
+                                  security: security as WifiSecurityType,
+                                },
+                              },
+                            })
+                          }
+                        >
+                          <SelectTrigger className={triggerClass} style={{ width: 150 }}>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent className={selectContentClass}>
+                            {SECURITY_OPTIONS.map((opt) => (
+                              <SelectItem key={opt} value={opt} className={selectItemClass}>
+                                {SECURITY_LABEL[opt]}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <label className='flex items-center gap-1.5 text-[12px] text-muted-foreground'>
+                          <Switch
+                            checked={Boolean(draft.perBand[bss.band]?.disable)}
+                            disabled={saving}
+                            onCheckedChange={(disable) =>
+                              setDraft({
+                                ...draft,
+                                perBand: { ...draft.perBand, [bss.band!]: { ...draft.perBand[bss.band!], disable } },
+                              })
+                            }
+                          />
+                          Off
+                        </label>
+                      </div>
+                    ),
+                )}
+
                 <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
                   <Switch
                     checked={draft.hidden}
@@ -450,6 +689,45 @@ export function RouterSettingsTab({
                       />
                       Disable DNS on this network
                     </label>
+                    <div className='flex flex-col gap-1'>
+                      <span className='text-[12px] text-muted-foreground'>
+                        Static DNS — one per line, domain(s)=address(es)
+                      </span>
+                      <textarea
+                        className={textareaClass}
+                        placeholder='myserver.local=192.168.1.50'
+                        rows={2}
+                        value={draft.dnsStaticEntriesText}
+                        disabled={saving}
+                        onChange={(e) => setDraft({ ...draft, dnsStaticEntriesText: e.target.value })}
+                      />
+                    </div>
+                    <div className='flex flex-col gap-1'>
+                      <span className='text-[12px] text-muted-foreground'>
+                        DNS forwarding — one per line, domain(s)=server(s)
+                      </span>
+                      <textarea
+                        className={textareaClass}
+                        placeholder='corp.example=10.0.0.1'
+                        rows={2}
+                        value={draft.dnsForwardRulesText}
+                        disabled={saving}
+                        onChange={(e) => setDraft({ ...draft, dnsForwardRulesText: e.target.value })}
+                      />
+                    </div>
+                    <div className='flex flex-col gap-1'>
+                      <span className='text-[12px] text-muted-foreground'>
+                        Static routes — one per line, subnet=gateway
+                      </span>
+                      <textarea
+                        className={textareaClass}
+                        placeholder='10.10.0.0/24=192.168.1.5'
+                        rows={2}
+                        value={draft.staticRoutesText}
+                        disabled={saving}
+                        onChange={(e) => setDraft({ ...draft, staticRoutesText: e.target.value })}
+                      />
+                    </div>
                   </div>
                 )}
 
@@ -574,17 +852,28 @@ export function RouterSettingsTab({
       {meshNodes.length > 0 && (
         <>
           <SectionLabel>Mesh nodes</SectionLabel>
-          {meshNodes.map((node, nodeIndex) => (
-            <SettingRow
-              key={nodeIndex}
-              title={node.displayName ?? "Mesh node"}
-              caption={node.hardwareVersion ? `hardware ${node.hardwareVersion}` : undefined}
-            >
-              <Badge tone={node.auth !== "MESH_AUTH_TRUSTED" ? "critical" : "neutral"}>
-                {node.auth === "MESH_AUTH_TRUSTED" ? "trusted" : (node.auth ?? "unknown")}
-              </Badge>
-            </SettingRow>
-          ))}
+          {meshNodes.map(([deviceId, node]) => {
+            const trusted = node.auth === "MESH_AUTH_TRUSTED";
+            return (
+              <SettingRow
+                key={deviceId}
+                title={node.displayName ?? "Mesh node"}
+                caption={node.hardwareVersion ? `hardware ${node.hardwareVersion}` : undefined}
+                note={meshResult?.id === deviceId ? meshResult.message : null}
+              >
+                <Badge tone={!trusted ? "critical" : "neutral"}>{trusted ? "trusted" : (node.auth ?? "unknown")}</Badge>
+                {cloudConnected && (
+                  <button
+                    className={actionButton("subtle")}
+                    disabled={meshBusyId === deviceId}
+                    onClick={() => void toggleMeshTrust(deviceId, !trusted)}
+                  >
+                    {meshBusyId === deviceId ? "Saving…" : trusted ? "Untrust" : "Trust"}
+                  </button>
+                )}
+              </SettingRow>
+            );
+          })}
         </>
       )}
 
@@ -611,7 +900,7 @@ export function RouterSettingsTab({
       <SectionLabel>Advanced</SectionLabel>
       <Callout tone={cloudConnected ? "info" : "error"} className='mb-1'>
         {cloudConnected
-          ? "These two write through your connected Starlink account's cloud session, not the local network -- every local write RPC on this router is confirmed blocked on current firmware (Permission denied)."
+          ? "These write through your connected Starlink account's cloud session, not the local network -- every local write RPC on this router is confirmed blocked on current firmware (Permission denied)."
           : "Confirmed blocked on current firmware (Permission denied on every local write RPC). Connect your Starlink account in the App tab to write these through the cloud instead."}
       </Callout>
 
@@ -688,6 +977,198 @@ export function RouterSettingsTab({
           <Badge>{FILTERING_LABEL[filteringLevel]}</Badge>
         )}
       </SettingRow>
+      {cloudConnected && filteringLevel > 0 && (
+        <div className='mb-2.5 flex items-center gap-2 pl-0.5'>
+          <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>Allow list</span>
+          <input
+            type='text'
+            placeholder='example.com, another.com'
+            className='h-7 flex-1 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink hover:border-input'
+            value={allowDomainsDraft}
+            disabled={filteringSaving}
+            onChange={(e) => setAllowDomainsDraft(e.target.value)}
+          />
+          <button
+            className={actionButton("subtle")}
+            disabled={filteringSaving}
+            onClick={() =>
+              void saveFiltering(
+                filteringLevel,
+                allowDomainsDraft.split(",").map((s) => s.trim()).filter(Boolean),
+              )
+            }
+          >
+            Save
+          </button>
+        </div>
+      )}
+      <SettingRow
+        title='Fail open'
+        caption='If content filtering itself becomes unreachable, keep internet working unfiltered rather than blocking it entirely'
+        note={radioNoteFor("failOpen")}
+      >
+        <Switch
+          checked={!wifiConfig.disableSandboxFailOpen}
+          disabled={radioDisabled}
+          onCheckedChange={(failOpen) => saveRadio("failOpen", { disableSandboxFailOpen: !failOpen })}
+        />
+      </SettingRow>
+
+      <SectionLabel>Radio</SectionLabel>
+      {(
+        [
+          ["2.4GHz", "2ghz"],
+          ["5GHz", "5ghz"],
+          ["5GHz high", "5ghzHigh"],
+        ] as const
+      ).map(([label, suffix]) => {
+        const disableField = `disable${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+          | "disable2ghz"
+          | "disable5ghz"
+          | "disable5ghzHigh";
+        const txField = `txPowerLevel${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+          | "txPowerLevel2ghz"
+          | "txPowerLevel5ghz"
+          | "txPowerLevel5ghzHigh";
+        const channelField = `channel${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+          | "channel2ghz"
+          | "channel5ghz"
+          | "channel5ghzHigh";
+        const modeField = `wirelessMode${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+          | "wirelessMode2ghz"
+          | "wirelessMode5ghz"
+          | "wirelessMode5ghzHigh";
+        const htField = `htBandwidth${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+          | "htBandwidth2ghz"
+          | "htBandwidth5ghz"
+          | "htBandwidth5ghzHigh";
+        return (
+          <div key={suffix} className='mb-2 flex flex-col gap-1.5'>
+            <span className='font-mono text-[10px] font-medium tracking-[0.08em] text-muted-foreground uppercase'>
+              {label}
+            </span>
+            <SettingRow title='Enabled' note={radioNoteFor(disableField)}>
+              <Switch
+                checked={!wifiConfig[disableField]}
+                disabled={radioDisabled}
+                onCheckedChange={(enabled) => saveRadio(disableField, { [disableField]: !enabled })}
+              />
+            </SettingRow>
+            <SettingRow title='Transmit power' note={radioNoteFor(txField)}>
+              <Select
+                value={(wifiConfig[txField] as string | undefined) ?? "TX_POWER_LEVEL_100"}
+                disabled={radioDisabled}
+                onValueChange={(v) => saveRadio(txField, { [txField]: v as TxPowerLevel })}
+              >
+                <SelectTrigger className={triggerClass} style={{ width: 90 }}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className={selectContentClass}>
+                  {TX_POWER_OPTIONS.map((opt) => (
+                    <SelectItem key={opt} value={opt} className={selectItemClass}>
+                      {TX_POWER_LABEL[opt]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </SettingRow>
+            <SettingRow title='Channel' caption='0 or blank = Auto' note={radioNoteFor(channelField)}>
+              <input
+                type='number'
+                className={narrowInputClass}
+                value={channelValue(channelField)}
+                disabled={radioDisabled}
+                onChange={(e) => setChannelDrafts({ ...channelDrafts, [channelField]: e.target.value })}
+                onBlur={(e) => {
+                  const n = Number(e.target.value);
+                  if (Number.isInteger(n) && n >= 0 && n <= 200) saveRadio(channelField, { [channelField]: n });
+                }}
+              />
+            </SettingRow>
+            <SettingRow title='Compatibility mode' note={radioNoteFor(modeField)}>
+              <Select
+                value={(wifiConfig[modeField] as string | undefined) ?? "WIRELESS_MODE_DEFAULT"}
+                disabled={radioDisabled}
+                onValueChange={(v) => saveRadio(modeField, { [modeField]: v as WirelessMode })}
+              >
+                <SelectTrigger className={triggerClass} style={{ width: 170 }}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className={selectContentClass}>
+                  {WIRELESS_MODE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt} value={opt} className={selectItemClass}>
+                      {WIRELESS_MODE_LABEL[opt]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </SettingRow>
+            <SettingRow title='Channel width' note={radioNoteFor(htField)}>
+              <Select
+                value={(wifiConfig[htField] as string | undefined) ?? "HT_BANDWIDTH_DEFAULT"}
+                disabled={radioDisabled}
+                onValueChange={(v) => saveRadio(htField, { [htField]: v as HtBandwidth })}
+              >
+                <SelectTrigger className={triggerClass} style={{ width: 110 }}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className={selectContentClass}>
+                  {HT_BANDWIDTH_OPTIONS.map((opt) => (
+                    <SelectItem key={opt} value={opt} className={selectItemClass}>
+                      {HT_BANDWIDTH_LABEL[opt]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </SettingRow>
+            {suffix !== "2ghz" && (
+              <SettingRow title='VHT width (802.11ac)' note={radioNoteFor(`vht${suffix}`)}>
+                <Select
+                  value={
+                    ((suffix === "5ghz" ? wifiConfig.vhtBandwidth : wifiConfig.vhtBandwidth5ghzHigh) as
+                      | string
+                      | undefined) ?? "VHT_BANDWIDTH_DEFAULT"
+                  }
+                  disabled={radioDisabled}
+                  onValueChange={(v) =>
+                    saveRadio(
+                      `vht${suffix}`,
+                      suffix === "5ghz"
+                        ? { vhtBandwidth: v as VhtBandwidth }
+                        : { vhtBandwidth5ghzHigh: v as VhtBandwidth },
+                    )
+                  }
+                >
+                  <SelectTrigger className={triggerClass} style={{ width: 110 }}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className={selectContentClass}>
+                    {VHT_BANDWIDTH_OPTIONS.map((opt) => (
+                      <SelectItem key={opt} value={opt} className={selectItemClass}>
+                        {VHT_BANDWIDTH_LABEL[opt]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </SettingRow>
+            )}
+          </div>
+        );
+      })}
+      <SettingRow title='Band steering' caption='Push dual-band devices onto 5GHz automatically' note={radioNoteFor("bandSteering")}>
+        <Switch
+          checked={!wifiConfig.disableBandSteering}
+          disabled={radioDisabled}
+          onCheckedChange={(enabled) => saveRadio("bandSteering", { disableBandSteering: !enabled })}
+        />
+      </SettingRow>
+      <SettingRow title='Allow new mesh nodes to pair' note={radioNoteFor("meshOnboarding")}>
+        <Switch
+          checked={!wifiConfig.disableMeshOnboarding}
+          disabled={radioDisabled}
+          onCheckedChange={(enabled) => saveRadio("meshOnboarding", { disableMeshOnboarding: !enabled })}
+        />
+      </SettingRow>
     </>
   );
 }
@@ -698,6 +1179,8 @@ const monoInputClass =
   "h-7 flex-1 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink hover:border-input";
 const narrowInputClass =
   "h-7 w-24 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink hover:border-input";
+const textareaClass =
+  "w-full resize-y rounded-sm border border-hairline bg-transparent px-2 py-1.5 font-mono text-[12px] text-ink hover:border-input";
 
 function FormRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (

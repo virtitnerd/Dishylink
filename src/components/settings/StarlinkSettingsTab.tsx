@@ -42,6 +42,11 @@ const LOCATION_MODE_LABEL: Record<"LOCAL" | "NONE", string> = {
   NONE: "Off",
 };
 
+const LEVEL_DISH_LABEL: Record<"TILT_LIKE_NORMAL" | "FORCE_LEVEL", string> = {
+  TILT_LIKE_NORMAL: "Normal",
+  FORCE_LEVEL: "Force level",
+};
+
 export function StarlinkSettingsTab({
   settings,
   status,
@@ -248,6 +253,31 @@ export function StarlinkSettingsTab({
                 {(Object.keys(LOCATION_MODE_LABEL) as Array<"LOCAL" | "NONE">).map((mode) => (
                   <SelectItem key={mode} value={mode} className={selectItemClass}>
                     {LOCATION_MODE_LABEL[mode]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </SettingRow>
+
+          <SettingRow
+            title='Dish leveling'
+            caption="Normal tilts to compensate for a non-level mount; Force level assumes it's already level"
+            note={noteFor("levelDish")}
+          >
+            <Select
+              value={config.levelDishMode ?? "TILT_LIKE_NORMAL"}
+              disabled={controlDisabled}
+              onValueChange={(mode) =>
+                save("levelDish", { levelDishMode: mode as "TILT_LIKE_NORMAL" | "FORCE_LEVEL" })
+              }
+            >
+              <SelectTrigger className={triggerClass} style={{ width: 118 }}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className={selectContentClass}>
+                {(Object.keys(LEVEL_DISH_LABEL) as Array<"TILT_LIKE_NORMAL" | "FORCE_LEVEL">).map((mode) => (
+                  <SelectItem key={mode} value={mode} className={selectItemClass}>
+                    {LEVEL_DISH_LABEL[mode]}
                   </SelectItem>
                 ))}
               </SelectContent>
