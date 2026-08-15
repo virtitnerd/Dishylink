@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -17,11 +18,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import client_totals
+import obstruction_snapshots
+import usage_energy
 from historian import Historian, JsonlSink, downsample
 from starlink_client import StarlinkError, get_client
 import webhook
@@ -74,16 +78,46 @@ def collect_sample() -> dict:
         row["router_alerts"] = client.get_router_status().get("alerts") or {}
     except StarlinkError:
         row["router_alerts"] = {}
+    try:
+        clients = client.get_wifi_clients().get("clients") or []
+        row["clients"] = [
+            {
+                "clientId": c.get("clientId"),
+                "mac": c.get("macAddress") or "",
+                "name": c.get("givenName") or c.get("name"),
+                "rx": int((c.get("rxStats") or {}).get("bytes") or 0),
+                "tx": int((c.get("txStats") or {}).get("bytes") or 0),
+            }
+            for c in clients
+        ]
+    except StarlinkError:
+        row["clients"] = []
     return row
 
 
+client_totals_store = client_totals.ClientTotals()
+client_totals_store.load()
+
+
 def collect_sample_and_notify() -> dict:
-    """The historian's own collect_fn -- collect_sample() plus the webhook
-    side effect. Kept separate from collect_sample() itself, which /metrics
-    also calls directly: an external Prometheus scraper polling independently
-    of the historian must not also drive (and fight over) webhook state."""
+    """The historian's own collect_fn -- collect_sample() plus side effects
+    that must only run once per real poll: the webhook check, folding this
+    poll's client byte counters into the usage odometer, and (throttled to
+    roughly hourly inside the module itself) an obstruction-map snapshot.
+    Kept separate from collect_sample() itself, which /metrics also calls
+    directly -- an external Prometheus scraper polling independently of the
+    historian must not also drive (and fight over) this state."""
     row = collect_sample()
     webhook.check_transitions(row)
+    for c in row.get("clients") or []:
+        client_totals_store.observe(c.get("clientId"), c.get("mac") or "", c.get("rx", 0), c.get("tx", 0), row["ts"], c.get("name"))
+    if row.get("clients"):
+        client_totals_store.compact(row["ts"])
+        client_totals_store.save()
+    try:
+        obstruction_snapshots.maybe_capture(get_client().get_obstruction_map, row["ts"])
+    except StarlinkError:
+        pass
     return row
 
 
@@ -139,6 +173,33 @@ def api_history_long(range: str = "day", max_points: int = 300):
     samples = sink.read_range(now - HISTORY_RANGES[range], now)
     samples.sort(key=lambda s: s["ts"])
     return JSONResponse({"ok": True, "data": downsample(samples, HISTORY_FIELDS, max_points)})
+
+
+def _range_start_s(range_: str, now_s: float) -> float:
+    bounds = usage_energy.bucket_bounds(range_, now_s)
+    return bounds[0][0] if bounds else now_s
+
+
+@app.get("/api/usage")
+def api_usage(range: str = "today"):
+    """Dishylink-shaped (see /api/samples's own note): UsageSummary at the top
+    level, no {ok, data} envelope -- a bad range answers with a non-2xx status
+    instead, which useDataUsage.ts already treats as "unavailable"."""
+    if range not in usage_energy.RANGES:
+        return JSONResponse({"error": f"range must be one of {sorted(usage_energy.RANGES)}"}, status_code=400)
+    now = time.time()
+    samples = sink.read_range(_range_start_s(range, now), now)
+    return usage_energy.usage_summary(range, samples, now)
+
+
+@app.get("/api/energy")
+def api_energy(range: str = "today"):
+    """Same shape/status-code convention as /api/usage above, for EnergySummary."""
+    if range not in usage_energy.RANGES:
+        return JSONResponse({"error": f"range must be one of {sorted(usage_energy.RANGES)}"}, status_code=400)
+    now = time.time()
+    samples = sink.read_range(_range_start_s(range, now), now)
+    return usage_energy.energy_summary(range, samples, now)
 
 
 def _derive_alert_episodes(samples: list[dict]) -> list[dict]:
@@ -298,6 +359,15 @@ def api_obstruction_map():
     return JSONResponse(safe(client.get_obstruction_map))
 
 
+@app.get("/api/obstruction/snapshots")
+def api_obstruction_snapshots():
+    """Dishylink-shaped: {snapshots} at the top level, no {ok, data} envelope.
+    Frames are captured roughly hourly by the historian's own poll loop --
+    see obstruction_snapshots.maybe_capture, called from
+    collect_sample_and_notify below."""
+    return {"snapshots": obstruction_snapshots.read_snapshots()}
+
+
 @app.get("/api/dish-config")
 def api_dish_config():
     """Present for API-coverage completeness -- overlaps with /api/status's `config` field, not used by the UI."""
@@ -428,6 +498,101 @@ def api_router_clients():
     return JSONResponse(safe(client.get_wifi_clients))
 
 
+# Extra lookback fetched (and discarded from the response) purely to seed the
+# first sample's delta -- without a prior reading its rate would read 0.
+_CLIENTS_LOOKBACK_PAD_S = 60.0
+
+
+def _client_samples(samples: list[dict], max_gap_s: float = 45.0) -> list[dict]:
+    """One row per (device, poll) with downMbps/upMbps computed from the
+    byte-counter delta against that device's previous poll -- same reset/gap
+    handling as client_totals.py's odometer (a counter that dropped is a
+    reset, not negative traffic; a gap too wide to measure across reads 0
+    rather than a spike), just expressed as a rate instead of a running sum."""
+    prev: dict[str, tuple[float, int, int]] = {}
+    out = []
+    for sample in samples:
+        ts = sample["ts"]
+        for c in sample.get("clients") or []:
+            key = client_totals.key_of(c.get("clientId"), c.get("mac") or "")
+            rx, tx = c.get("rx", 0), c.get("tx", 0)
+            down_mbps = up_mbps = 0.0
+            prior = prev.get(key)
+            if prior:
+                prev_ts, prev_rx, prev_tx = prior
+                dt = ts - prev_ts
+                if 0 < dt <= max_gap_s:
+                    if rx >= prev_rx:
+                        down_mbps = (rx - prev_rx) * 8 / dt / 1e6
+                    if tx >= prev_tx:
+                        up_mbps = (tx - prev_tx) * 8 / dt / 1e6
+            prev[key] = (ts, rx, tx)
+            out.append({
+                "key": key,
+                "macAddress": c.get("mac") or "",
+                "atMs": int(ts * 1000),
+                "downMbps": down_mbps,
+                "upMbps": up_mbps,
+            })
+    return out
+
+
+@app.get("/api/clients")
+def api_clients(hours: float = 6, samples: int = 0, since: float = 0, totals: int = 0):
+    """Dishylink-shaped (see /api/samples's own note): {history, samples,
+    totals?} at the top level. `history` is always empty -- unlike dishylink's
+    own recorder (a short raw window plus a coarser long-term rollup), this
+    historian keeps every poll at full resolution indefinitely, so there's no
+    separate coarse tier to serve; `samples` alone covers the whole range."""
+    now = time.time()
+    start_s = (since / 1000) if since else now - hours * 3600
+    rows = sink.read_range(start_s - _CLIENTS_LOOKBACK_PAD_S, now)
+    rows.sort(key=lambda s: s["ts"])
+    rate_rows = _client_samples(rows)
+    floor_ms = since if since else start_s * 1000
+    rate_rows = [r for r in rate_rows if r["atMs"] > floor_ms]
+    out: dict[str, Any] = {"history": [], "samples": rate_rows}
+    if totals:
+        out["totals"] = client_totals_store.totals()
+    return out
+
+
+@app.get("/api/clients/totals")
+def api_clients_totals():
+    return {"totals": client_totals_store.totals(), "mergeCandidates": client_totals_store.merge_candidates(time.time())}
+
+
+@app.delete("/api/clients/totals")
+def api_clients_totals_delete(client: str | None = None):
+    if client is None:
+        client_totals_store.clear()
+        found = True
+    else:
+        found = client_totals_store.remove(client)
+    client_totals_store.save()
+    if not found:
+        return JSONResponse({"ok": False, "error": "unknown device"}, status_code=404)
+    return {"ok": True}
+
+
+@app.post("/api/clients/totals/reset")
+def api_clients_totals_reset(client: str):
+    ok = client_totals_store.reset(client, time.time())
+    client_totals_store.save()
+    if not ok:
+        return JSONResponse({"ok": False, "error": "unknown device"}, status_code=404)
+    return {"ok": True}
+
+
+@app.post("/api/clients/totals/merge")
+def api_clients_totals_merge(from_key: str = Query(alias="from"), to_key: str = Query(alias="to"), distinct: str | None = None):
+    ok = client_totals_store.reject_merge(from_key, to_key) if distinct else client_totals_store.merge(from_key, to_key)
+    client_totals_store.save()
+    if not ok:
+        return JSONResponse({"ok": False, "error": "cannot merge"}, status_code=400)
+    return {"ok": True}
+
+
 @app.get("/api/router/status")
 def api_router_status():
     client = get_client()
@@ -478,6 +643,41 @@ def api_radio():
         for radio in stats.get("radioStats") or []
     ]
     return {"current": current, "atMs": int(time.time() * 1000)}
+
+
+def _local_ips() -> set[str]:
+    """This machine's own routable addresses -- used to tell a same-host
+    viewer (open this dashboard's own tab) from a remote one (someone else on
+    the LAN pointed a browser at this host)."""
+    ips: set[str] = set()
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))  # never actually sent; just picks the outbound interface
+        ips.add(probe.getsockname()[0])
+        probe.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return ips
+
+
+@app.get("/api/whoami")
+def api_whoami(request: Request):
+    """Dishylink-shaped: {ips, macs} at the top level -- read by
+    selfIdentity.ts's web path to flag "This device" in the client list.
+    Remote viewer -> just their own address, echoed back. Same-host viewer ->
+    every address this machine answers on. MACs are never populated here (no
+    portable interface-MAC read without a new dependency); IP alone is enough
+    for matchesSelf() to still flag the row correctly."""
+    caller_ip = (request.client.host if request.client else "").replace("::ffff:", "")
+    local_ips = _local_ips()
+    if caller_ip and caller_ip in local_ips | {"127.0.0.1", "::1"}:
+        return {"ips": sorted(local_ips), "macs": []}
+    return {"ips": [caller_ip] if caller_ip else [], "macs": []}
 
 
 # -- router -- writes ---------------------------------------------------------
