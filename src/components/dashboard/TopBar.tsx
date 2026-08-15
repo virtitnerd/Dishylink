@@ -51,6 +51,12 @@ const THEME_ICON: Record<ThemeName, typeof SunIcon> = {
 // button — repeated in the strip.
 const statusItem =
   "inline-flex items-center gap-[7px] whitespace-nowrap text-[12.5px] font-medium text-ink-secondary";
+// Same as statusItem, but display starts at `hidden` instead of an unconditional
+// `inline-flex` -- letting a later `lg:inline-flex` turn it on at that breakpoint.
+// Two unconditional display utilities on one element (inline-flex + hidden) are a
+// genuine tie in Tailwind's cascade, and which one wins isn't something to rely on.
+const hideableStatusItem =
+  "hidden items-center gap-[7px] whitespace-nowrap text-[12.5px] font-medium text-ink-secondary";
 const statusDivider = "border-l border-input pl-2.5";
 const iconButton =
   "inline-flex size-8 cursor-pointer items-center justify-center rounded-full border-0 bg-card text-ink-secondary transition-colors hover:text-foreground";
@@ -80,12 +86,12 @@ export function TopBar({
             {CONNECTION_LABEL[connectionState]}
           </span>
           {status?.deviceInfo?.countryCode && (
-            <span className={`${statusItem} ${statusDivider}`}>
+            <span className={`${hideableStatusItem} ${statusDivider} lg:inline-flex`}>
               {status.deviceInfo.countryCode}
             </span>
           )}
           {status?.deviceState?.uptimeS && (
-            <span className={`${statusItem} ${statusDivider}`}>
+            <span className={`${hideableStatusItem} ${statusDivider} lg:inline-flex`}>
               up {formatUptime(Number(status.deviceState.uptimeS))}
             </span>
           )}

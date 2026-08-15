@@ -99,6 +99,12 @@ export default defineConfig(({ command }) => ({
     ],
   },
   server: {
+    // Binds all interfaces, not just localhost -- lets a phone on the same
+    // network reach this via the machine's LAN IP for a quick mobile check.
+    // The /api proxy below still talks to 127.0.0.1:8787 either way: that
+    // hop is Vite's own Node process talking to the backend locally, not the
+    // phone talking to it directly.
+    host: true,
     proxy: {
       "/dishy": {
         target: "http://192.168.100.1:9201",
@@ -128,13 +134,14 @@ export default defineConfig(({ command }) => ({
         rewrite: (path) => path.replace(/^\/celestrak/, ""),
       },
       // Long-term energy totals from the local historian service (collector/).
-      // xfwd adds x-forwarded-for so /api/whoami sees the browser's LAN IP, not
-      // this proxy's loopback address.
-      // 127.0.0.1, not localhost: the historian binds v4 loopback, and Node
-      // resolves localhost verbatim — often to ::1 first, which nothing answers.
+      // Our own FastAPI backend (server.py, from the original StarlinkDashboard
+      // build) -- replaces dishylink's own historian/grpc-web proxy as the real
+      // data source; see core/dishClient.ts. 127.0.0.1, not localhost: Node
+      // resolves localhost verbatim, often to ::1 first, which nothing answers.
       "/api": {
-        target: "http://127.0.0.1:8088",
+        target: "http://127.0.0.1:8787/api",
         changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ""),
         xfwd: true,
       },
       // Cloudflare speed endpoints for the browser-measured speed test

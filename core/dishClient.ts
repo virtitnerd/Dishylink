@@ -1,43 +1,20 @@
-// Client for the Starlink dish's local gRPC API (SpaceX.API.Device.Device/Handle),
-// spoken as grpc-web through the dev-server proxy at /dishy.
-//
-// Requests are trivial — a single empty sub-message selected by oneof field
-// number — so they are hand-encoded. Responses are decoded dynamically with
-// the descriptor set dumped from the dish's own gRPC reflection service
-// (public/dish.protoset), so field numbers and types are never guessed.
+// Client for the Starlink dish/router local API -- fetched as plain JSON from
+// our own FastAPI backend (server.py + starlink_client.py), which does the
+// actual gRPC/gRPC-Web work server-side via dynamic reflection (no vendored
+// proto files to keep in sync). This file used to speak grpc-web directly to
+// the dish/router from the browser; that's now server.py's job. Every method
+// signature and return type below is unchanged, so no calling component had
+// to change -- only the transport underneath did.
 
-import {
-  createFileRegistry,
-  fromBinary,
-  fromJson,
-  toBinary,
-  toJson,
-  type DescMessage,
-  type JsonValue,
-  type Registry,
-} from "@bufbuild/protobuf";
-import { FileDescriptorSetSchema } from "@bufbuild/protobuf/wkt";
-import { grpcWebUnaryCall } from "./grpcWeb";
+// The FastAPI backend's own address. Same-origin by default (it also serves
+// this app's built static files); override for a dev setup where the two run
+// on different ports.
+let apiBase = "/api";
 
-// Same Device service on both boxes; the schema protoset is identical. The
-// defaults are the dev/Electron same-origin proxy paths; a host that reaches the
-// boxes directly (the extension, whose host permissions allow it) rebinds them.
-const DISH_HANDLE_URL = "/dishy/SpaceX.API.Device.Device/Handle";
-const ROUTER_HANDLE_URL = "/router/SpaceX.API.Device.Device/Handle";
-
-interface DishHost {
-  dishHandleUrl?: string;
-  routerHandleUrl?: string;
-  protosetUrl?: string;
-}
-
-let dishHost: DishHost = {};
-
-/** Called once by a host entry point, before the UI renders. Leaving a box's URL
- *  unset keeps its default proxy path — for the extension that path 404s against
- *  its own origin, so an unconfigured box is simply never reached. */
-export function setDishHost(binding: DishHost): void {
-  dishHost = binding;
+/** Called once by a host entry point, before the UI renders, if the backend
+ *  isn't same-origin (e.g. `npm run dev` against a separately-run server.py). */
+export function setApiBase(base: string): void {
+  apiBase = base.replace(/\/$/, "");
 }
 
 /** The router's LAN address — the only one it answers on, which is what makes it
@@ -45,22 +22,43 @@ export function setDishHost(binding: DishHost): void {
  *  to reach it into the one wording every surface reports. */
 export const ROUTER_LAN_ADDRESS = "192.168.1.1";
 
-// Oneof field numbers inside SpaceX.API.Device.Request (from the dish schema).
-const REQUEST_FIELD = {
-  reboot: 1001,
-  getStatus: 1004,
-  getHistory: 1007,
-  getDeviceInfo: 1008,
-  getLocation: 1017,
-  dishStow: 2002,
-  dishGetObstructionMap: 2008,
-  wifiGetClients: 3002,
-  getRadioStats: 1036,
-  getDiagnostics: 6000,
-  dishGetConfig: 2011,
-  wifiGetConfig: 3009,
-  dishClearObstructionMap: 2017,
-} as const;
+/**
+ * @deprecated No-op kept only so the Electron/extension entry points (which
+ * bind a direct grpc-web host during their own bootstrap) keep compiling.
+ * This fork's web build talks to our own FastAPI backend (see setApiBase)
+ * instead of a grpc-web proxy, so a dish/router host binding has nothing to
+ * do here. Not wired into the web target yet.
+ */
+export function setDishHost(_binding: {
+  dishHandleUrl?: string;
+  routerHandleUrl?: string;
+  protosetUrl?: string;
+}): void {}
+
+interface ApiEnvelope<T> {
+  ok: boolean;
+  data?: T;
+  error?: string;
+}
+
+async function apiGet<T>(path: string, abortSignal?: AbortSignal): Promise<T> {
+  const res = await fetch(`${apiBase}${path}`, { signal: abortSignal });
+  const payload = (await res.json()) as ApiEnvelope<T>;
+  if (!payload.ok) throw new Error(payload.error ?? `${path} failed`);
+  return payload.data as T;
+}
+
+async function apiPost<T>(path: string, body?: unknown, abortSignal?: AbortSignal): Promise<T> {
+  const res = await fetch(`${apiBase}${path}`, {
+    method: "POST",
+    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: abortSignal,
+  });
+  const payload = (await res.json()) as ApiEnvelope<T>;
+  if (!payload.ok) throw new Error(payload.error ?? `${path} failed`);
+  return payload.data as T;
+}
 
 // ---------- response JSON shapes (proto3 JSON mapping; uint64 → string) ----------
 
@@ -223,18 +221,6 @@ export interface DishConfigJson {
   swupdateThreeDayDeferralEnabled?: boolean;
 }
 
-/** config field → its apply_* flag (both sides proto3 JSON names) */
-const CONFIG_APPLY_FLAG: Record<keyof DishConfigJson, string> = {
-  snowMeltMode: "applySnowMeltMode",
-  locationRequestMode: "applyLocationRequestMode",
-  levelDishMode: "applyLevelDishMode",
-  powerSaveStartMinutes: "applyPowerSaveStartMinutes",
-  powerSaveDurationMinutes: "applyPowerSaveDurationMinutes",
-  powerSaveMode: "applyPowerSaveMode",
-  swupdateRebootHour: "applySwupdateRebootHour",
-  swupdateThreeDayDeferralEnabled: "applySwupdateThreeDayDeferralEnabled",
-};
-
 export interface DishDiagnosticsJson {
   id?: string;
   hardwareVersion?: string;
@@ -256,6 +242,10 @@ export interface WifiLanNetworkJson {
   ipv4?: string;
   domain?: string;
   basicServiceSets?: WifiBasicServiceSetJson[];
+  /** Content filtering ("sandboxing"): per-network, not per-band -- band is only
+   *  how setContentFiltering locates which network to apply it to. */
+  sandboxEnabled?: boolean;
+  sandboxDomainAllowList?: string[];
 }
 
 /** A mesh node the router has been paired with, keyed in `meshConfigs` by the
@@ -275,6 +265,11 @@ export interface WifiNetworkConfigJson {
   meshConfigs?: Record<string, WifiMeshNodeJson>;
   clientConfigs?: Array<{ clientId?: number; macAddress?: string; givenName?: string }>;
   boot?: { evenSideSoftwareVersion?: string; oddSideSoftwareVersion?: string; lastReason?: string };
+  /** Disables the router's own WiFi in favor of a third-party router on its
+   *  ethernet port. Read-only here -- see setBypassMode's own risk note. */
+  bypassMode?: boolean;
+  nameservers?: string[];
+  customDnsDisabled?: boolean;
   [key: string]: unknown;
 }
 
@@ -372,20 +367,6 @@ export interface WifiClientJson {
   txStats?: WifiClientStatsJson;
 }
 
-interface DishResponseJson {
-  dishGetStatus?: DishStatusJson;
-  dishGetHistory?: DishHistoryJson;
-  getDeviceInfo?: { deviceInfo?: DishDeviceInfoJson };
-  getLocation?: DishLocationJson;
-  dishGetObstructionMap?: DishObstructionMapJson;
-  wifiGetClients?: { clients?: WifiClientJson[] };
-  getRadioStats?: RadioStatsJson;
-  dishGetConfig?: { dishConfig?: DishConfigJson & Record<string, unknown> };
-  dishGetDiagnostics?: DishDiagnosticsJson;
-  wifiGetConfig?: { wifiConfig?: WifiNetworkConfigJson };
-  wifiGetStatus?: WifiStatusJson;
-}
-
 /** The router's own get_status. Its alerts are a different set from the dish's. */
 export interface WifiStatusJson {
   deviceInfo?: DishDeviceInfoJson;
@@ -415,208 +396,118 @@ export interface RadioStatsJson {
   }>;
 }
 
-// ---------- request encoding ----------
-
-function encodeVarint(value: number): number[] {
-  const bytes: number[] = [];
-  let remaining = value;
-  while (remaining > 0x7f) {
-    bytes.push((remaining & 0x7f) | 0x80);
-    remaining >>>= 7;
-  }
-  bytes.push(remaining);
-  return bytes;
-}
-
-/** Encode a Request whose oneof selects `fieldNumber` with the given sub-message bytes. */
-function encodeOneofRequest(fieldNumber: number, subMessageBytes: number[] = []): Uint8Array {
-  const LENGTH_DELIMITED_WIRE_TYPE = 2;
-  const fieldTag = (fieldNumber << 3) | LENGTH_DELIMITED_WIRE_TYPE;
-  return new Uint8Array([...encodeVarint(fieldTag), subMessageBytes.length, ...subMessageBytes]);
-}
-
 // ---------- client ----------
 
 export class DishClient {
-  private constructor(
-    private readonly handleUrl: string,
-    private readonly requestSchema: DescMessage,
-    private readonly responseSchema: DescMessage,
-    private readonly registry: Registry,
-  ) {}
+  private constructor(private readonly target: "dish" | "router") {}
 
-  /**
-   * Load the descriptor set dumped from the dish's reflection service.
-   *
-   * The default handle URLs are the dev/Electron proxy paths; a host that reaches
-   * the dish directly overrides them. The extension does: its service worker has
-   * no proxy, so it passes the absolute `192.168.100.1:9201` grpc-web endpoint,
-   * which its host permissions allow it to fetch cross-origin.
-   */
-  static async load(
-    target: "dish" | "router" = "dish",
-    options: { handleUrl?: string; protosetUrl?: string } = {},
-  ): Promise<DishClient> {
-    const protosetResponse = await fetch(
-      options.protosetUrl ?? dishHost.protosetUrl ?? "/dish.protoset",
-    );
-    const protosetBytes = new Uint8Array(await protosetResponse.arrayBuffer());
-    const fileDescriptorSet = fromBinary(FileDescriptorSetSchema, protosetBytes);
-    const registry = createFileRegistry(fileDescriptorSet);
-    const requestSchema = registry.getMessage("SpaceX.API.Device.Request");
-    const responseSchema = registry.getMessage("SpaceX.API.Device.Response");
-    if (!requestSchema || !responseSchema)
-      throw new Error("Device Request/Response missing from dish.protoset");
-    const hostDefault = target === "dish" ? dishHost.dishHandleUrl : dishHost.routerHandleUrl;
-    const handleUrl =
-      options.handleUrl ?? hostDefault ?? (target === "dish" ? DISH_HANDLE_URL : ROUTER_HANDLE_URL);
-    return new DishClient(handleUrl, requestSchema, responseSchema, registry);
-  }
-
-  private async call(
-    fieldNumber: number,
-    abortSignal?: AbortSignal,
-    subMessageBytes: number[] = [],
-  ): Promise<DishResponseJson> {
-    const responseBytes = await grpcWebUnaryCall(
-      this.handleUrl,
-      encodeOneofRequest(fieldNumber, subMessageBytes),
-      abortSignal,
-    );
-    const responseMessage = fromBinary(this.responseSchema, responseBytes);
-    return toJson(this.responseSchema, responseMessage, {
-      registry: this.registry,
-    }) as DishResponseJson;
+  /** No network round-trip needed anymore (no protoset to fetch) -- async only
+   *  to keep every call site that awaits DishClient.load(...) unchanged. */
+  static async load(target: "dish" | "router" = "dish"): Promise<DishClient> {
+    return new DishClient(target);
   }
 
   async getStatus(abortSignal?: AbortSignal): Promise<DishStatusJson> {
-    return (await this.call(REQUEST_FIELD.getStatus, abortSignal)).dishGetStatus ?? {};
+    return apiGet<DishStatusJson>("/status", abortSignal);
   }
 
-  /** The ROUTER's own status — same request field, different device, different
-   *  response branch. Carries the router's alert set (PoE faults, mesh health). */
+  /** The ROUTER's own status. Carries the router's alert set (PoE faults, mesh health). */
   async getRouterStatus(abortSignal?: AbortSignal): Promise<WifiStatusJson> {
-    return (await this.call(REQUEST_FIELD.getStatus, abortSignal)).wifiGetStatus ?? {};
+    return apiGet<WifiStatusJson>("/router/status", abortSignal);
   }
 
   async getHistory(abortSignal?: AbortSignal): Promise<DishHistoryJson> {
-    return (await this.call(REQUEST_FIELD.getHistory, abortSignal)).dishGetHistory ?? {};
+    return apiGet<DishHistoryJson>("/history", abortSignal);
   }
 
   async getDeviceInfo(abortSignal?: AbortSignal): Promise<DishDeviceInfoJson> {
-    return (
-      (await this.call(REQUEST_FIELD.getDeviceInfo, abortSignal)).getDeviceInfo?.deviceInfo ?? {}
-    );
+    const status = await apiGet<DishStatusJson>("/status", abortSignal);
+    return status.deviceInfo ?? {};
   }
 
   async getObstructionMap(abortSignal?: AbortSignal): Promise<DishObstructionMapJson> {
-    return (
-      (await this.call(REQUEST_FIELD.dishGetObstructionMap, abortSignal)).dishGetObstructionMap ??
-      {}
-    );
+    return apiGet<DishObstructionMapJson>("/obstruction-map", abortSignal);
   }
 
   /**
-   * Dish GPS position. Throws GrpcWebError status 7 on consumer plans —
-   * "Disabled due to policy" since the May 2026 firmware; the app's old
-   * "Allow access on local network" toggle no longer exists.
+   * Dish GPS position. Throws (status 7, "Disabled due to policy") on consumer
+   * plans since mid-2026 firmware -- the app's old "Allow access on local
+   * network" toggle no longer exists.
    */
   async getLocation(abortSignal?: AbortSignal): Promise<DishLocationJson> {
-    return (await this.call(REQUEST_FIELD.getLocation, abortSignal)).getLocation ?? {};
+    return apiGet<DishLocationJson>("/location", abortSignal);
   }
 
   /** Connected clients — meaningful on the ROUTER target. */
   async getWifiClients(abortSignal?: AbortSignal): Promise<WifiClientJson[]> {
-    return (
-      (await this.call(REQUEST_FIELD.wifiGetClients, abortSignal)).wifiGetClients?.clients ?? []
-    );
+    const data = await apiGet<{ clients?: WifiClientJson[] }>("/router/clients", abortSignal);
+    return data.clients ?? [];
   }
 
   /** Per-radio Wi-Fi stats — meaningful on the ROUTER target. The only real
    *  temperatures anything on this network reports; the dish answers Unimplemented. */
   async getRadioStats(abortSignal?: AbortSignal): Promise<RadioStatsJson> {
-    return (await this.call(REQUEST_FIELD.getRadioStats, abortSignal)).getRadioStats ?? {};
+    return apiGet<RadioStatsJson>("/router/radio-stats", abortSignal);
   }
 
   /** Reboot this device (dish or router). Drops connectivity for a few minutes. */
   async reboot(abortSignal?: AbortSignal): Promise<void> {
-    await this.call(REQUEST_FIELD.reboot, abortSignal);
+    await apiPost(this.target === "dish" ? "/reboot" : "/router/reboot", undefined, abortSignal);
   }
 
-  /** Stow (fold flat) or unstow the dish. Motorized (mast) models only. */
+  /** Stow (fold flat) or unstow the dish. Motorized (mast) models only -- a
+   *  no-op RPC on electronically-steered kits (this network's Mini). */
   async stow(unstow: boolean, abortSignal?: AbortSignal): Promise<void> {
-    // DishStowRequest { bool unstow = 1 } — field 1, varint wire type
-    await this.call(REQUEST_FIELD.dishStow, abortSignal, unstow ? [0x08, 0x01] : []);
-  }
-
-  // ---------- schema-encoded requests (config writes and richer payloads) ----------
-
-  /** Encode a full Request from proto3 JSON via the bundled schema. */
-  private async callJson(
-    requestJson: Record<string, unknown>,
-    abortSignal?: AbortSignal,
-  ): Promise<DishResponseJson> {
-    const requestMessage = fromJson(this.requestSchema, requestJson as JsonValue, {
-      registry: this.registry,
-    });
-    const responseBytes = await grpcWebUnaryCall(
-      this.handleUrl,
-      toBinary(this.requestSchema, requestMessage),
-      abortSignal,
-    );
-    const responseMessage = fromBinary(this.responseSchema, responseBytes);
-    return toJson(this.responseSchema, responseMessage, {
-      registry: this.registry,
-    }) as DishResponseJson;
+    await apiPost(`/stow?unstow=${unstow}`, undefined, abortSignal);
   }
 
   /** Current dish configuration (sleep schedule, snow melt, update window …). */
   async getConfig(abortSignal?: AbortSignal): Promise<DishConfigJson & Record<string, unknown>> {
-    return (
-      (await this.call(REQUEST_FIELD.dishGetConfig, abortSignal)).dishGetConfig?.dishConfig ?? {}
+    const data = await apiGet<{ dishConfig?: DishConfigJson & Record<string, unknown> }>(
+      "/dish-config",
+      abortSignal,
     );
+    return data.dishConfig ?? {};
   }
 
   /**
    * Apply a partial config change. Only the fields present are written — the
-   * matching apply_* flags are set automatically so untouched knobs stay put.
+   * matching apply_* flags are set automatically (server-side, in
+   * starlink_client.py's set_dish_config) so untouched knobs stay put.
+   *
+   * As of mid-2026 firmware this -- like every local write RPC -- returns
+   * PERMISSION_DENIED (grpc status 7); Starlink's official app writes through
+   * their cloud, not the LAN. Kept wired up (not hidden) so it goes live the
+   * moment that changes, or once cloud-auth writes are added here.
    */
   async setConfig(changes: DishConfigJson, abortSignal?: AbortSignal): Promise<void> {
-    const dishConfig: Record<string, unknown> = {};
-    for (const [field, value] of Object.entries(changes)) {
-      if (value === undefined) continue;
-      dishConfig[field] = value;
-      dishConfig[CONFIG_APPLY_FLAG[field as keyof DishConfigJson]] = true;
-    }
-    await this.callJson({ dishSetConfig: { dishConfig } }, abortSignal);
+    await apiPost("/settings/dish-config", { changes }, abortSignal);
   }
 
-  /** Dish self-diagnostics: disablement code, hardware self-test, alerts. */
+  /** Self-diagnostics: disablement code, hardware self-test, alerts. */
   async getDiagnostics(abortSignal?: AbortSignal): Promise<DishDiagnosticsJson> {
-    return (await this.call(REQUEST_FIELD.getDiagnostics, abortSignal)).dishGetDiagnostics ?? {};
+    return apiGet(this.target === "dish" ? "/diagnostics" : "/router/diagnostics", abortSignal);
   }
 
-  /** Wipe the learned sky map and restart the obstruction survey. */
+  /** Wipe the learned sky map and restart the obstruction survey. Blocked by
+   *  firmware the same as setConfig -- see its note above. */
   async clearObstructionMap(abortSignal?: AbortSignal): Promise<void> {
-    await this.call(REQUEST_FIELD.dishClearObstructionMap, abortSignal);
+    await apiPost("/obstruction-map/clear", undefined, abortSignal);
   }
 
   /** Router WiFi configuration (SSID, channels, mesh) — ROUTER target. */
   async getWifiConfig(abortSignal?: AbortSignal): Promise<WifiNetworkConfigJson> {
-    return (
-      (await this.call(REQUEST_FIELD.wifiGetConfig, abortSignal)).wifiGetConfig?.wifiConfig ?? {}
-    );
+    const data = await apiGet<{ wifiConfig?: WifiNetworkConfigJson }>("/router/config", abortSignal);
+    return data.wifiConfig ?? {};
   }
 
-  /** Rename a client device (persists in the router) — ROUTER target. */
+  /** Rename a client device (persists in the router) — ROUTER target. Blocked
+   *  by firmware the same as setConfig -- see its note above. */
   async setClientGivenName(
     macAddress: string,
     givenName: string,
     abortSignal?: AbortSignal,
   ): Promise<void> {
-    await this.callJson(
-      { wifiSetClientGivenName: { clientName: { macAddress, givenName } } },
-      abortSignal,
-    );
+    await apiPost("/router/clients/name", { mac_address: macAddress, given_name: givenName }, abortSignal);
   }
 }

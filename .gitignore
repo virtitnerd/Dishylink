@@ -14,6 +14,14 @@ collector/data
 # Local Starlink account session for the dev cloud proxy (never commit).
 .starlink-cookie
 
+# Python backend (backend/) runtime artifacts.
+backend/__pycache__/
+backend/*.pyc
+backend/server.log
+backend/server.pid
+backend/history/
+backend/cache/
+
 # Claude Code's local settings/session state — machine-specific, not shared config.
 .claude/
 

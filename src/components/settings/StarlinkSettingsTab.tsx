@@ -31,6 +31,11 @@ const SNOW_MELT_LABEL: Record<SnowMeltMode, string> = {
   ALWAYS_OFF: "Off",
 };
 
+const LOCATION_MODE_LABEL: Record<"LOCAL" | "NONE", string> = {
+  LOCAL: "Local",
+  NONE: "Off",
+};
+
 export function StarlinkSettingsTab({
   settings,
   status,
@@ -180,6 +185,30 @@ export function StarlinkSettingsTab({
               disabled={settings.saving}
               onCheckedChange={(enabled) => save({ swupdateThreeDayDeferralEnabled: enabled })}
             />
+          </SettingRow>
+
+          <SettingRow
+            title='Location sharing'
+            caption='GPS access for the local API -- separately blocked by Starlink policy since mid-2026 regardless of this setting'
+          >
+            <Select
+              value={config.locationRequestMode ?? "LOCAL"}
+              disabled={settings.saving}
+              onValueChange={(mode) =>
+                save({ locationRequestMode: mode as "LOCAL" | "NONE" })
+              }
+            >
+              <SelectTrigger className={triggerClass} style={{ width: 92 }}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className={selectContentClass}>
+                {(Object.keys(LOCATION_MODE_LABEL) as Array<"LOCAL" | "NONE">).map((mode) => (
+                  <SelectItem key={mode} value={mode} className={selectItemClass}>
+                    {LOCATION_MODE_LABEL[mode]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </SettingRow>
 
           <SettingRow
