@@ -9,6 +9,7 @@
 
 import { GrpcWebError, grpcWebUnaryCall } from "../core/grpcWeb";
 import type { RouterClientUpdate } from "../core/routerClientUpdate";
+import type { RouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate";
 
 const AUTH_URL = "https://api.starlink.com/auth-rp/auth/user";
 const API = "https://starlink.com/api";
@@ -48,6 +49,10 @@ export interface CloudHandlerOptions {
   /** Trusted host callback: reads the local router and encodes exactly one
    *  client update. Renderer-provided protobuf is never accepted. */
   prepareDeviceUpdate?: (update: RouterClientUpdate) => Promise<Uint8Array>;
+  /** Same trust boundary as prepareDeviceUpdate, for WifiConfig-level writes
+   *  (custom DNS today; bypass mode and content filtering once each has had
+   *  its own careful verification -- see routerWifiConfigUpdate.ts). */
+  prepareWifiConfigUpdate?: (update: RouterWifiConfigUpdate) => Promise<Uint8Array>;
 }
 
 /** The durable half of the session — without it a token refresh can't happen, so
@@ -132,6 +137,7 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
   const retryDelayMs = options.retryDelayMs ?? 150;
   const deviceCallTimeoutMs = options.deviceCallTimeoutMs ?? 15_000;
   const prepareDeviceUpdate = options.prepareDeviceUpdate;
+  const prepareWifiConfigUpdate = options.prepareWifiConfigUpdate;
 
   let cachedCookie: string | null = null;
   let cachedAt = 0;
@@ -436,5 +442,80 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     return mutation;
   }
 
-  return { handle, connect, disconnect, updateClient };
+  /** Same trust boundary as validUpdate above: the renderer names a change,
+   *  never protobuf. */
+  function validWifiConfigUpdate(update: RouterWifiConfigUpdate): boolean {
+    if (update?.kind === "dns")
+      return (
+        Array.isArray(update.nameservers) &&
+        update.nameservers.length <= 8 &&
+        update.nameservers.every((ns) => typeof ns === "string" && ns.length <= 64) &&
+        typeof update.disabled === "boolean"
+      );
+    if (update?.kind === "bypassMode") return typeof update.enabled === "boolean";
+    if (update?.kind === "contentFiltering")
+      return (
+        (update.level === 0 || update.level === 1 || update.level === 2) &&
+        (update.allowDomains === undefined ||
+          (Array.isArray(update.allowDomains) &&
+            update.allowDomains.length <= 64 &&
+            update.allowDomains.every((d) => typeof d === "string" && d.length <= 255)))
+      );
+    return false;
+  }
+
+  async function applyWifiConfigUpdate(update: RouterWifiConfigUpdate): Promise<CloudResult> {
+    if (!readCookie()) return NOT_CONNECTED;
+    try {
+      if (!prepareWifiConfigUpdate)
+        return { status: 503, body: { error: "wifi_config_update_unavailable" } };
+      const requestBytes = await prepareWifiConfigUpdate(update);
+      const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
+      await withFreshCookie(async (cookie) => {
+        try {
+          await grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
+            fetch: doFetch,
+            headers: { cookie },
+          });
+        } catch (error) {
+          if (error instanceof GrpcWebError && error.grpcStatus === 16)
+            throw new SessionExpiredError();
+          throw error;
+        }
+      }, abortSignal);
+      return { status: 200, body: { ok: true } };
+    } catch (error) {
+      if (error instanceof SessionExpiredError) return NOT_CONNECTED;
+      if (error instanceof DOMException && error.name === "TimeoutError") {
+        return {
+          status: 504,
+          body: {
+            error: "device_call_timeout",
+            message: "Starlink did not answer the WiFi config update in time. Try again.",
+          },
+        };
+      }
+      return {
+        status: 502,
+        body: { error: "device_call_failed", message: (error as Error).message },
+      };
+    }
+  }
+
+  /** Shares deviceMutationTail with updateClient above: both rewrite pieces of
+   *  the same router WifiConfig, so a rename in flight and a DNS change in
+   *  flight must not be built from the same stale snapshot. */
+  function updateWifiConfig(update: RouterWifiConfigUpdate): Promise<CloudResult> {
+    if (!validWifiConfigUpdate(update))
+      return Promise.resolve({ status: 400, body: { error: "bad_request" } });
+
+    const mutation = deviceMutationTail.then(() => applyWifiConfigUpdate(update));
+    deviceMutationTail = mutation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return mutation;
+  }
+
+  return { handle, connect, disconnect, updateClient, updateWifiConfig };
 }

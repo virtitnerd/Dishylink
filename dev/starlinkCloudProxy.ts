@@ -12,9 +12,11 @@ import { resolve } from "node:path";
 import type { Plugin } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createCloudHandler } from "../cloud/starlinkCloudHandler.ts";
-import { DishClient, ROUTER_LAN_HANDLE_URL } from "../core/dishClient.ts";
+import { DishClient, ROUTER_LAN_HANDLE_URL, setApiBase } from "../core/dishClient.ts";
 import { prepareRouterClientUpdate } from "../core/routerClientUpdate.ts";
 import type { RouterClientUpdate } from "../core/routerClientUpdate.ts";
+import { prepareRouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate.ts";
+import type { RouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate.ts";
 import { localNetworkIdentity } from "../core/hostNetworkIdentity.ts";
 
 const COOKIE_FILE = resolve(process.cwd(), ".starlink-cookie");
@@ -73,6 +75,14 @@ export function starlinkCloudProxy(): Plugin {
   return {
     name: "starlink-cloud-proxy",
     configureServer(server) {
+      // This plugin's callbacks run in the Vite dev server's own Node process,
+      // not the browser -- Node's fetch (unlike the browser's) has no page
+      // origin to resolve a relative "/api/..." against, so the DishClient
+      // instance built here needs an absolute base pointed at our FastAPI
+      // backend. Scoped to this process only: the browser's own DishClient
+      // instances (everything the rest of the UI uses) keep the relative
+      // default, proxied through Vite's own /api entry in vite.config.ts.
+      setApiBase("http://127.0.0.1:8787/api");
       let routerPromise: Promise<DishClient> | null = null;
       const handler = createCloudHandler({
         readCookie,
@@ -86,6 +96,15 @@ export function starlinkCloudProxy(): Plugin {
             ),
           });
           return prepareRouterClientUpdate(await routerPromise, update, localNetworkIdentity());
+        },
+        prepareWifiConfigUpdate: async (update) => {
+          routerPromise ??= DishClient.load("router", {
+            handleUrl: ROUTER_LAN_HANDLE_URL,
+            protosetBytes: new Uint8Array(
+              readFileSync(resolve(process.cwd(), "public/dish.protoset")),
+            ),
+          });
+          return prepareRouterWifiConfigUpdate(await routerPromise, update);
         },
       });
       server.middlewares.use(async (req: IncomingMessage, res: ServerResponse, next) => {
@@ -120,6 +139,16 @@ export function starlinkCloudProxy(): Plugin {
           try {
             const update = JSON.parse((await readBody(req)) || "{}") as RouterClientUpdate;
             const result = await handler.updateClient(update);
+            return sendJson(res, result.status, result.body);
+          } catch (error) {
+            return sendJson(res, 400, { error: "bad_request", message: (error as Error).message });
+          }
+        }
+
+        if (route === "/cloud/wifi-config" && req.method === "POST") {
+          try {
+            const update = JSON.parse((await readBody(req)) || "{}") as RouterWifiConfigUpdate;
+            const result = await handler.updateWifiConfig(update);
             return sendJson(res, result.status, result.body);
           } catch (error) {
             return sendJson(res, 400, { error: "bad_request", message: (error as Error).message });

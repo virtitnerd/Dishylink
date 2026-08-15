@@ -24,17 +24,25 @@ import {
 } from "@bufbuild/protobuf";
 import { FileDescriptorSetSchema } from "@bufbuild/protobuf/wkt";
 
+async function parseRequestSchema(
+  protosetBytes: Uint8Array,
+): Promise<{ requestSchema: DescMessage; registry: Registry }> {
+  const fileDescriptorSet = fromBinary(FileDescriptorSetSchema, protosetBytes);
+  const registry = createFileRegistry(fileDescriptorSet);
+  const requestSchema = registry.getMessage("SpaceX.API.Device.Request");
+  if (!requestSchema) throw new Error("Device Request missing from dish.protoset");
+  return { requestSchema, registry };
+}
+
 let requestSchemaPromise: Promise<{ requestSchema: DescMessage; registry: Registry }> | null = null;
 
+/** Browser fallback: a relative fetch resolves fine against the page's own
+ *  origin. Node-side callers (no page origin to resolve against) supply
+ *  protosetBytes to DishClient.load() instead -- see its own note. */
 function loadRequestSchema(): Promise<{ requestSchema: DescMessage; registry: Registry }> {
   requestSchemaPromise ??= (async () => {
     const protosetResponse = await fetch("/dish.protoset");
-    const protosetBytes = new Uint8Array(await protosetResponse.arrayBuffer());
-    const fileDescriptorSet = fromBinary(FileDescriptorSetSchema, protosetBytes);
-    const registry = createFileRegistry(fileDescriptorSet);
-    const requestSchema = registry.getMessage("SpaceX.API.Device.Request");
-    if (!requestSchema) throw new Error("Device Request missing from dish.protoset");
-    return { requestSchema, registry };
+    return parseRequestSchema(new Uint8Array(await protosetResponse.arrayBuffer()));
   })();
   return requestSchemaPromise;
 }
@@ -276,9 +284,13 @@ export interface WifiLanNetworkJson {
   ipv4?: string;
   domain?: string;
   basicServiceSets?: WifiBasicServiceSetJson[];
-  /** Content filtering ("sandboxing"): per-network, not per-band -- band is only
-   *  how setContentFiltering locates which network to apply it to. */
+  /** Content filtering (the official app's term) is "sandbox" in this schema.
+   *  sandboxId is the official app's 3-way level -- see
+   *  core/routerWifiConfigUpdate.ts's ContentFilteringLevel for the mapping
+   *  and how confident it is. Not a declared protobuf enum, so there are no
+   *  value labels to read off the schema itself. */
   sandboxEnabled?: boolean;
+  sandboxId?: number;
   sandboxDomainAllowList?: string[];
 }
 
@@ -452,22 +464,35 @@ export interface RadioStatsJson {
 // ---------- client ----------
 
 export class DishClient {
-  private constructor(private readonly target: "dish" | "router") {}
+  private constructor(
+    private readonly target: "dish" | "router",
+    /** Set only by a caller that already has the protoset bytes in hand (the
+     *  dev cloud proxy reads them off disk with Node fs -- see its own note on
+     *  why: its process can't do a relative `fetch("/dish.protoset")` the way
+     *  a browser tab can). Everything else falls back to loadRequestSchema's
+     *  lazy HTTP fetch, shared module-wide. */
+    private readonly schemaOverride: Promise<{ requestSchema: DescMessage; registry: Registry }> | null = null,
+  ) {}
 
   /**
-   * No network round-trip needed anymore (no protoset to fetch) -- async only
-   * to keep every call site that awaits DishClient.load(...) unchanged.
+   * No network round-trip needed anymore for local calls (no protoset to
+   * fetch) -- async only to keep every call site that awaits
+   * DishClient.load(...) unchanged.
    *
-   * `options` is accepted-but-ignored for compatibility with the Electron/
-   * extension entry points, which still pass a grpc-web host binding during
-   * their own bootstrap (see setDishHost's own note) -- this web target talks
-   * to our FastAPI backend instead, so there's nothing here to configure.
+   * `handleUrl`/`protosetUrl` are accepted-but-ignored, for compatibility
+   * with the Electron/extension entry points, which still pass a grpc-web
+   * host binding during their own bootstrap (see setDishHost's own note).
+   * `protosetBytes`, if given, is used -- it's how a Node-side caller (no
+   * relative fetch available) supplies what encodeRequest needs.
    */
   static async load(
     target: "dish" | "router" = "dish",
-    _options: { handleUrl?: string; protosetUrl?: string; protosetBytes?: Uint8Array } = {},
+    options: { handleUrl?: string; protosetUrl?: string; protosetBytes?: Uint8Array } = {},
   ): Promise<DishClient> {
-    return new DishClient(target);
+    const schemaOverride = options.protosetBytes
+      ? parseRequestSchema(options.protosetBytes)
+      : null;
+    return new DishClient(target, schemaOverride);
   }
 
   async getStatus(abortSignal?: AbortSignal): Promise<DishStatusJson> {
@@ -527,7 +552,7 @@ export class DishClient {
   /** Encode a Device.Request for an authenticated host to send through the cloud
    *  gateway. This does not perform a local router write. */
   async encodeRequest(requestJson: object): Promise<Uint8Array> {
-    const { requestSchema, registry } = await loadRequestSchema();
+    const { requestSchema, registry } = await (this.schemaOverride ?? loadRequestSchema());
     return toBinary(requestSchema, fromJson(requestSchema, requestJson as JsonValue, { registry }));
   }
 
