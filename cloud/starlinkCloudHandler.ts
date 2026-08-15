@@ -14,6 +14,48 @@ import type { DishConfigJson } from "../core/dishClient";
 import type { DishUpdate } from "../core/dishConfigUpdate";
 
 const VALID_NETWORK_MODES: ReadonlySet<NetworkMode> = new Set(["default", "guest", "auto"]);
+const VALID_SECURITY_TYPES: ReadonlySet<string> = new Set(["wpa2", "wpa3", "wpa2wpa3", "open"]);
+const VALID_TX_POWER_LEVELS: ReadonlySet<string> = new Set([
+  "TX_POWER_LEVEL_100",
+  "TX_POWER_LEVEL_80",
+  "TX_POWER_LEVEL_50",
+  "TX_POWER_LEVEL_25",
+  "TX_POWER_LEVEL_12",
+  "TX_POWER_LEVEL_6",
+]);
+const VALID_WIRELESS_MODES: ReadonlySet<string> = new Set([
+  "WIRELESS_MODE_DEFAULT",
+  "A_ONLY",
+  "B_ONLY",
+  "G_ONLY",
+  "N_ONLY",
+  "B_G_MIXED",
+  "A_N_MIXED",
+  "G_N_MIXED",
+  "B_G_N_MIXED",
+  "A_AN_AC_MIXED",
+  "AN_AC_MIXED",
+  "B_G_N_AX_MIXED",
+  "A_AN_AC_AX_MIXED",
+]);
+const VALID_HT_BANDWIDTHS: ReadonlySet<string> = new Set([
+  "HT_BANDWIDTH_DEFAULT",
+  "HT_BANDWIDTH_20_MHZ",
+  "HT_BANDWIDTH_20_OR_40_MHZ",
+]);
+const VALID_VHT_BANDWIDTHS: ReadonlySet<string> = new Set([
+  "VHT_BANDWIDTH_DEFAULT",
+  "VHT_BANDWIDTH_DISABLED",
+  "VHT_BANDWIDTH_80_MHZ",
+  "VHT_BANDWIDTH_160_MHZ",
+  "VHT_BANDWIDTH_80_PLUS_80_MHZ",
+]);
+/** Raw channel numbers aren't a declared enum in the schema (no fixed list to
+ *  check against) -- just bound them to a range no real channel exceeds, so a
+ *  stray value can't reach the router as something wildly malformed. */
+function isValidChannel(value: unknown): boolean {
+  return value === undefined || (Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 200);
+}
 const VALID_SNOW_MELT_MODES: ReadonlySet<string> = new Set(["AUTO", "ALWAYS_ON", "ALWAYS_OFF"]);
 const VALID_LOCATION_MODES: ReadonlySet<string> = new Set(["NONE", "LOCAL"]);
 const VALID_LEVEL_DISH_MODES: ReadonlySet<string> = new Set(["TILT_LIKE_NORMAL", "FORCE_LEVEL"]);
@@ -490,11 +532,15 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
         typeof update.ssid === "string" &&
         update.ssid.length > 0 &&
         update.ssid.length <= 32 &&
-        // Required, not optional -- see routerWifiConfigUpdate.ts's own note:
-        // an absent password would round-trip the router's read-back mask.
-        typeof update.password === "string" &&
-        update.password.length > 0 &&
-        (update.hidden === undefined || typeof update.hidden === "boolean")
+        // Required for every security type except "open" -- see
+        // routerWifiConfigUpdate.ts's own note: an absent password would
+        // round-trip the router's read-back mask.
+        (update.security === "open"
+          ? update.password === "" || typeof update.password === "string"
+          : typeof update.password === "string" && update.password.length > 0) &&
+        (update.hidden === undefined || typeof update.hidden === "boolean") &&
+        (update.disable === undefined || typeof update.disable === "boolean") &&
+        (update.security === undefined || VALID_SECURITY_TYPES.has(update.security))
       );
     if (update?.kind === "networkSettings")
       return (
@@ -513,7 +559,10 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
             update.dhcpv4LeaseDurationS > 0 &&
             update.dhcpv4LeaseDurationS <= 30 * 86400)) &&
         (update.dhcpDisabled === undefined || typeof update.dhcpDisabled === "boolean") &&
-        (update.dnsDisabled === undefined || typeof update.dnsDisabled === "boolean")
+        (update.dnsDisabled === undefined || typeof update.dnsDisabled === "boolean") &&
+        (update.dnsStaticEntries === undefined || validDnsStaticEntries(update.dnsStaticEntries)) &&
+        (update.dnsForwardRules === undefined || validDnsForwardRules(update.dnsForwardRules)) &&
+        (update.staticRoutes === undefined || validStaticRoutes(update.staticRoutes))
       );
     if (update?.kind === "addNetwork")
       return (
@@ -528,7 +577,86 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
       );
     if (update?.kind === "deleteNetwork")
       return typeof update.networkDomain === "string" && update.networkDomain.length > 0;
+    if (update?.kind === "routerAdvanced")
+      return (
+        (update.disableSandboxFailOpen === undefined || typeof update.disableSandboxFailOpen === "boolean") &&
+        (update.txPowerLevel2ghz === undefined || VALID_TX_POWER_LEVELS.has(update.txPowerLevel2ghz)) &&
+        (update.txPowerLevel5ghz === undefined || VALID_TX_POWER_LEVELS.has(update.txPowerLevel5ghz)) &&
+        (update.txPowerLevel5ghzHigh === undefined || VALID_TX_POWER_LEVELS.has(update.txPowerLevel5ghzHigh)) &&
+        (update.disable2ghz === undefined || typeof update.disable2ghz === "boolean") &&
+        (update.disable5ghz === undefined || typeof update.disable5ghz === "boolean") &&
+        (update.disable5ghzHigh === undefined || typeof update.disable5ghzHigh === "boolean") &&
+        isValidChannel(update.channel2ghz) &&
+        isValidChannel(update.channel5ghz) &&
+        isValidChannel(update.channel5ghzHigh) &&
+        (update.wirelessMode2ghz === undefined || VALID_WIRELESS_MODES.has(update.wirelessMode2ghz)) &&
+        (update.wirelessMode5ghz === undefined || VALID_WIRELESS_MODES.has(update.wirelessMode5ghz)) &&
+        (update.wirelessMode5ghzHigh === undefined || VALID_WIRELESS_MODES.has(update.wirelessMode5ghzHigh)) &&
+        (update.htBandwidth2ghz === undefined || VALID_HT_BANDWIDTHS.has(update.htBandwidth2ghz)) &&
+        (update.htBandwidth5ghz === undefined || VALID_HT_BANDWIDTHS.has(update.htBandwidth5ghz)) &&
+        (update.htBandwidth5ghzHigh === undefined || VALID_HT_BANDWIDTHS.has(update.htBandwidth5ghzHigh)) &&
+        (update.vhtBandwidth === undefined || VALID_VHT_BANDWIDTHS.has(update.vhtBandwidth)) &&
+        (update.vhtBandwidth5ghzHigh === undefined || VALID_VHT_BANDWIDTHS.has(update.vhtBandwidth5ghzHigh)) &&
+        (update.disableBandSteering === undefined || typeof update.disableBandSteering === "boolean") &&
+        (update.disableMeshOnboarding === undefined || typeof update.disableMeshOnboarding === "boolean")
+      );
+    if (update?.kind === "meshTrust")
+      return typeof update.deviceId === "string" && update.deviceId.length > 0 && typeof update.trusted === "boolean";
     return false;
+  }
+
+  function validStringList(value: unknown, maxCount: number, maxLen: number): boolean {
+    return (
+      Array.isArray(value) &&
+      value.length <= maxCount &&
+      value.every((v) => typeof v === "string" && v.length > 0 && v.length <= maxLen)
+    );
+  }
+
+  function validDnsStaticEntries(value: unknown): boolean {
+    return (
+      Array.isArray(value) &&
+      value.length <= 32 &&
+      value.every(
+        (e) =>
+          e &&
+          typeof e === "object" &&
+          validStringList((e as { domains?: unknown }).domains, 16, 255) &&
+          validStringList((e as { addresses?: unknown }).addresses, 16, 64),
+      )
+    );
+  }
+
+  function validDnsForwardRules(value: unknown): boolean {
+    return (
+      Array.isArray(value) &&
+      value.length <= 32 &&
+      value.every(
+        (e) =>
+          e &&
+          typeof e === "object" &&
+          validStringList((e as { domains?: unknown }).domains, 16, 255) &&
+          validStringList((e as { serverAddresses?: unknown }).serverAddresses, 16, 64),
+      )
+    );
+  }
+
+  function validStaticRoutes(value: unknown): boolean {
+    return (
+      Array.isArray(value) &&
+      value.length <= 32 &&
+      value.every(
+        (r) =>
+          r &&
+          typeof r === "object" &&
+          typeof (r as { subnet?: unknown }).subnet === "string" &&
+          ((r as { subnet: string }).subnet.length > 0) &&
+          ((r as { subnet: string }).subnet.length <= 64) &&
+          typeof (r as { gateway?: unknown }).gateway === "string" &&
+          ((r as { gateway: string }).gateway.length > 0) &&
+          ((r as { gateway: string }).gateway.length <= 64),
+      )
+    );
   }
 
   async function applyWifiConfigUpdate(update: RouterWifiConfigUpdate): Promise<CloudResult> {

@@ -1,4 +1,12 @@
-import type { DishClient, WifiLanNetworkJson } from "./dishClient";
+import type {
+  DishClient,
+  HtBandwidth,
+  TxPowerLevel,
+  VhtBandwidth,
+  WifiLanNetworkJson,
+  WifiSecurityType,
+  WirelessMode,
+} from "./dishClient";
 
 export interface RouterWifiConfigRequestJson {
   targetId: string;
@@ -136,8 +144,15 @@ export type RouterWifiConfigUpdate =
       networkDomain: string;
       band: string;
       ssid: string;
+      /** Required for every security type except "open", where the schema's
+       *  auth_open sub-message carries no fields at all. */
       password: string;
       hidden?: boolean;
+      /** Turns this one band off without deleting it -- distinct from hidden,
+       *  which keeps broadcasting but drops the SSID from scan lists. */
+      disable?: boolean;
+      /** Defaults to "wpa2" (unchanged) when omitted -- see WifiSecurityType. */
+      security?: WifiSecurityType;
     }
   | {
       kind: "networkSettings";
@@ -149,6 +164,9 @@ export type RouterWifiConfigUpdate =
       dhcpv4LeaseDurationS?: number;
       dhcpDisabled?: boolean;
       dnsDisabled?: boolean;
+      dnsStaticEntries?: { domains: string[]; addresses: string[] }[];
+      dnsForwardRules?: { domains: string[]; serverAddresses: string[] }[];
+      staticRoutes?: { subnet: string; gateway: string }[];
     }
   | {
       kind: "addNetwork";
@@ -158,7 +176,45 @@ export type RouterWifiConfigUpdate =
       mode: NetworkMode;
       hidden?: boolean;
     }
-  | { kind: "deleteNetwork"; networkDomain: string };
+  | { kind: "deleteNetwork"; networkDomain: string }
+  /** Flat WifiConfig-level radio/onboarding knobs -- no read-modify-write
+   *  needed (unlike everything touching networks[]), since each field carries
+   *  its own apply_<field> flag the same as "dns"/"bypassMode" do. */
+  | {
+      kind: "routerAdvanced";
+      disableSandboxFailOpen?: boolean;
+      txPowerLevel2ghz?: TxPowerLevel;
+      txPowerLevel5ghz?: TxPowerLevel;
+      txPowerLevel5ghzHigh?: TxPowerLevel;
+      disable2ghz?: boolean;
+      disable5ghz?: boolean;
+      disable5ghzHigh?: boolean;
+      channel2ghz?: number;
+      channel5ghz?: number;
+      channel5ghzHigh?: number;
+      wirelessMode2ghz?: WirelessMode;
+      wirelessMode5ghz?: WirelessMode;
+      wirelessMode5ghzHigh?: WirelessMode;
+      htBandwidth2ghz?: HtBandwidth;
+      htBandwidth5ghz?: HtBandwidth;
+      htBandwidth5ghzHigh?: HtBandwidth;
+      vhtBandwidth?: VhtBandwidth;
+      vhtBandwidth5ghzHigh?: VhtBandwidth;
+      disableBandSteering?: boolean;
+      disableMeshOnboarding?: boolean;
+    }
+  /** Trust/untrust one paired mesh node -- a map entry update (meshConfigs is
+   *  keyed by deviceId), so it needs the same read-modify-write as networks[]. */
+  | { kind: "meshTrust"; deviceId: string; trusted: boolean };
+
+/** Builds exactly the one auth_* sub-message a security type needs -- open
+ *  carries no fields at all, everything else just carries the password. */
+function authFieldsFor(security: WifiSecurityType | undefined, password: string): Record<string, unknown> {
+  if (security === "wpa3") return { authWpa3: { password } };
+  if (security === "wpa2wpa3") return { authWpa2Wpa3: { password } };
+  if (security === "open") return { authOpen: {} };
+  return { authWpa2: { password } };
+}
 
 /** Trusted-host preparation, mirroring prepareRouterClientUpdate: source the
  *  target device id directly from the local router immediately before
@@ -222,11 +278,16 @@ export async function prepareRouterWifiConfigUpdate(
         basicServiceSets: (network.basicServiceSets ?? []).map((bss) => {
           if (bss.band !== update.band) return bss;
           matched = true;
+          // The auth_* fields are a oneof -- strip every variant the read
+          // brought back before setting exactly the one this write wants, or
+          // a stale authWpa2 would ride along next to a fresh authWpa3.
+          const { authWpa2: _wpa2, authWpa3: _wpa3, authWpa2Wpa3: _mixed, authOpen: _open, ...bare } = bss;
           return {
-            ...bss,
+            ...bare,
             ssid: update.ssid,
-            authWpa2: { password: update.password },
+            ...authFieldsFor(update.security, update.password),
             ...(update.hidden !== undefined ? { hidden: update.hidden } : {}),
+            ...(update.disable !== undefined ? { disable: update.disable } : {}),
           };
         }),
       };
@@ -253,6 +314,9 @@ export async function prepareRouterWifiConfigUpdate(
           : {}),
         ...(update.dhcpDisabled !== undefined ? { dhcpDisabled: update.dhcpDisabled } : {}),
         ...(update.dnsDisabled !== undefined ? { dnsDisabled: update.dnsDisabled } : {}),
+        ...(update.dnsStaticEntries !== undefined ? { dnsStaticEntries: update.dnsStaticEntries } : {}),
+        ...(update.dnsForwardRules !== undefined ? { dnsForwardRules: update.dnsForwardRules } : {}),
+        ...(update.staticRoutes !== undefined ? { staticRoutes: update.staticRoutes } : {}),
       };
     });
     if (!matched) throw new Error(`no network "${update.networkDomain}" found`);
@@ -295,6 +359,37 @@ export async function prepareRouterWifiConfigUpdate(
     if (networks.length === existing.length)
       throw new Error(`no network "${update.networkDomain}" found`);
     return router.encodeRequest(wifiConfigRequestFor(targetId, { networks }));
+  }
+
+  if (update.kind === "routerAdvanced") {
+    // Flat WifiConfig fields, each with its own apply_<field> flag -- no read
+    // needed, same as "dns"/"bypassMode" above.
+    const { kind: _kind, disableMeshOnboarding, ...changes } = update;
+    const allChanges: Record<string, unknown> = { ...changes };
+    // The schema splits wired vs wireless mesh pairing into two flags; the UI
+    // offers one "lock mesh onboarding" toggle, so both are set together.
+    if (disableMeshOnboarding !== undefined) {
+      allChanges.disableMeshOnboarding = disableMeshOnboarding;
+      allChanges.disableWirelessMeshOnboarding = disableMeshOnboarding;
+    }
+    if (Object.keys(allChanges).length === 0) throw new Error("no changes given");
+    return router.encodeRequest(wifiConfigRequestFor(targetId, allChanges));
+  }
+
+  if (update.kind === "meshTrust") {
+    // meshConfigs is a map keyed by deviceId -- read-modify-write the one
+    // entry, same reason networks[] needs it (the write replaces whichever
+    // fields are sent, and a map can't be partially indexed into by the
+    // schema's apply_meshConfigs flag alone).
+    const config = await router.getWifiConfig(AbortSignal.timeout(5_000));
+    const existing = config.meshConfigs ?? {};
+    const node = existing[update.deviceId];
+    if (!node) throw new Error(`no mesh node "${update.deviceId}" found`);
+    const meshConfigs = {
+      ...existing,
+      [update.deviceId]: { ...node, auth: update.trusted ? "MESH_AUTH_TRUSTED" : "MESH_AUTH_UNTRUSTED" },
+    };
+    return router.encodeRequest(wifiConfigRequestFor(targetId, { meshConfigs }));
   }
 
   throw new Error(`unhandled update kind`);

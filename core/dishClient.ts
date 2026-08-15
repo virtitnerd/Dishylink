@@ -255,6 +255,9 @@ export type SnowMeltMode = "AUTO" | "ALWAYS_ON" | "ALWAYS_OFF";
 export interface DishConfigJson {
   snowMeltMode?: SnowMeltMode;
   locationRequestMode?: "NONE" | "LOCAL";
+  /** Whether the dish tilts to compensate for a non-level mount ("normal") or
+   *  assumes it's already level and points straight up when idle -- a mast/roof
+   *  install on a slope wants FORCE_LEVEL; the default is right for everyone else. */
   levelDishMode?: "TILT_LIKE_NORMAL" | "FORCE_LEVEL";
   powerSaveStartMinutes?: number;
   powerSaveDurationMinutes?: number;
@@ -273,6 +276,11 @@ export interface DishDiagnosticsJson {
   alignmentStats?: DishAlignmentStatsJson;
 }
 
+/** Which of the schema's auth sub-messages is present tells the router which
+ *  security type this band uses -- open has no fields at all, WPA3 and the
+ *  WPA2/WPA3-mixed transitional mode carry the same shape WPA2 does. */
+export type WifiSecurityType = "wpa2" | "wpa3" | "wpa2wpa3" | "open";
+
 export interface WifiBasicServiceSetJson {
   bssid?: string;
   ssid?: string;
@@ -282,6 +290,10 @@ export interface WifiBasicServiceSetJson {
    *  resupply the actual password, never round-trip this. See
    *  setRouterWifiSsid's own note for why that matters. */
   authWpa2?: { password?: string };
+  authWpa3?: { password?: string };
+  authWpa2Wpa3?: { password?: string };
+  /** Present (as `{}`) when this band is open/unsecured -- absent otherwise. */
+  authOpen?: Record<string, never>;
   hidden?: boolean;
   disable?: boolean;
 }
@@ -313,6 +325,14 @@ export interface WifiLanNetworkJson {
   dhcpv4LeaseDurationS?: number;
   dhcpDisabled?: boolean;
   dnsDisabled?: boolean;
+  /** Local DNS overrides for this network -- domains resolved straight to the
+   *  given addresses rather than going out to the real resolver. */
+  dnsStaticEntries?: { domains?: string[]; addresses?: string[] }[];
+  /** Per-domain DNS forwarding -- these domains go to the given server(s)
+   *  instead of the network's own resolver. */
+  dnsForwardRules?: { domains?: string[]; serverAddresses?: string[] }[];
+  /** Extra routes this network's devices get, beyond the default gateway. */
+  staticRoutes?: { subnet?: string; gateway?: string }[];
 }
 
 /** A mesh node the router has been paired with, keyed in `meshConfigs` by the
@@ -326,6 +346,38 @@ export interface WifiMeshNodeJson {
   lastConnected?: string;
 }
 
+export type TxPowerLevel =
+  | "TX_POWER_LEVEL_100"
+  | "TX_POWER_LEVEL_80"
+  | "TX_POWER_LEVEL_50"
+  | "TX_POWER_LEVEL_25"
+  | "TX_POWER_LEVEL_12"
+  | "TX_POWER_LEVEL_6";
+
+export type WirelessMode =
+  | "WIRELESS_MODE_DEFAULT"
+  | "A_ONLY"
+  | "B_ONLY"
+  | "G_ONLY"
+  | "N_ONLY"
+  | "B_G_MIXED"
+  | "A_N_MIXED"
+  | "G_N_MIXED"
+  | "B_G_N_MIXED"
+  | "A_AN_AC_MIXED"
+  | "AN_AC_MIXED"
+  | "B_G_N_AX_MIXED"
+  | "A_AN_AC_AX_MIXED";
+
+export type HtBandwidth = "HT_BANDWIDTH_DEFAULT" | "HT_BANDWIDTH_20_MHZ" | "HT_BANDWIDTH_20_OR_40_MHZ";
+
+export type VhtBandwidth =
+  | "VHT_BANDWIDTH_DEFAULT"
+  | "VHT_BANDWIDTH_DISABLED"
+  | "VHT_BANDWIDTH_80_MHZ"
+  | "VHT_BANDWIDTH_160_MHZ"
+  | "VHT_BANDWIDTH_80_PLUS_80_MHZ";
+
 export interface WifiNetworkConfigJson {
   countryCode?: string;
   networks?: WifiLanNetworkJson[];
@@ -337,6 +389,35 @@ export interface WifiNetworkConfigJson {
   bypassMode?: boolean;
   nameservers?: string[];
   customDnsDisabled?: boolean;
+  /** Whether content filtering fails open (internet keeps working, unfiltered)
+   *  or closed (internet blocks entirely) if the filtering service itself is
+   *  unreachable. Only meaningful while content filtering is on. */
+  disableSandboxFailOpen?: boolean;
+  txPowerLevel2ghz?: TxPowerLevel;
+  txPowerLevel5ghz?: TxPowerLevel;
+  txPowerLevel5ghzHigh?: TxPowerLevel;
+  disable2ghz?: boolean;
+  disable5ghz?: boolean;
+  disable5ghzHigh?: boolean;
+  /** Raw channel number -- not a declared enum in the schema, so there's no
+   *  fixed valid-value list to validate against here; 0/absent means Auto. */
+  channel2ghz?: number;
+  channel5ghz?: number;
+  channel5ghzHigh?: number;
+  wirelessMode2ghz?: WirelessMode;
+  wirelessMode5ghz?: WirelessMode;
+  wirelessMode5ghzHigh?: WirelessMode;
+  htBandwidth2ghz?: HtBandwidth;
+  htBandwidth5ghz?: HtBandwidth;
+  htBandwidth5ghzHigh?: HtBandwidth;
+  vhtBandwidth?: VhtBandwidth;
+  vhtBandwidth5ghzHigh?: VhtBandwidth;
+  disableBandSteering?: boolean;
+  /** Bundled together in the UI as one "lock mesh onboarding" toggle -- the
+   *  schema splits wired vs wireless mesh pairing into two flags, but nothing
+   *  about this router's setup needs them set independently. */
+  disableMeshOnboarding?: boolean;
+  disableWirelessMeshOnboarding?: boolean;
   [key: string]: unknown;
 }
 
