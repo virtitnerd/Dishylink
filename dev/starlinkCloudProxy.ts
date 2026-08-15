@@ -17,6 +17,8 @@ import { prepareRouterClientUpdate } from "../core/routerClientUpdate.ts";
 import type { RouterClientUpdate } from "../core/routerClientUpdate.ts";
 import { prepareRouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate.ts";
 import type { RouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate.ts";
+import { prepareDishUpdate } from "../core/dishConfigUpdate.ts";
+import type { DishUpdate } from "../core/dishConfigUpdate.ts";
 import { localNetworkIdentity } from "../core/hostNetworkIdentity.ts";
 
 const COOKIE_FILE = resolve(process.cwd(), ".starlink-cookie");
@@ -84,6 +86,7 @@ export function starlinkCloudProxy(): Plugin {
       // default, proxied through Vite's own /api entry in vite.config.ts.
       setApiBase("http://127.0.0.1:8787/api");
       let routerPromise: Promise<DishClient> | null = null;
+      let dishPromise: Promise<DishClient> | null = null;
       const handler = createCloudHandler({
         readCookie,
         writeCookie,
@@ -105,6 +108,14 @@ export function starlinkCloudProxy(): Plugin {
             ),
           });
           return prepareRouterWifiConfigUpdate(await routerPromise, update);
+        },
+        prepareDishUpdate: async (update) => {
+          dishPromise ??= DishClient.load("dish", {
+            protosetBytes: new Uint8Array(
+              readFileSync(resolve(process.cwd(), "public/dish.protoset")),
+            ),
+          });
+          return prepareDishUpdate(await dishPromise, update);
         },
       });
       server.middlewares.use(async (req: IncomingMessage, res: ServerResponse, next) => {
@@ -149,6 +160,16 @@ export function starlinkCloudProxy(): Plugin {
           try {
             const update = JSON.parse((await readBody(req)) || "{}") as RouterWifiConfigUpdate;
             const result = await handler.updateWifiConfig(update);
+            return sendJson(res, result.status, result.body);
+          } catch (error) {
+            return sendJson(res, 400, { error: "bad_request", message: (error as Error).message });
+          }
+        }
+
+        if (route === "/cloud/dish-config" && req.method === "POST") {
+          try {
+            const update = JSON.parse((await readBody(req)) || "{}") as DishUpdate;
+            const result = await handler.updateDishConfig(update);
             return sendJson(res, result.status, result.body);
           } catch (error) {
             return sendJson(res, 400, { error: "bad_request", message: (error as Error).message });

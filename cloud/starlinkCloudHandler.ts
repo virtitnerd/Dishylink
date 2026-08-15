@@ -10,8 +10,23 @@
 import { GrpcWebError, grpcWebUnaryCall } from "../core/grpcWeb";
 import type { RouterClientUpdate } from "../core/routerClientUpdate";
 import { SUBNET_OPTIONS, type NetworkMode, type RouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate";
+import type { DishConfigJson } from "../core/dishClient";
+import type { DishUpdate } from "../core/dishConfigUpdate";
 
 const VALID_NETWORK_MODES: ReadonlySet<NetworkMode> = new Set(["default", "guest", "auto"]);
+const VALID_SNOW_MELT_MODES: ReadonlySet<string> = new Set(["AUTO", "ALWAYS_ON", "ALWAYS_OFF"]);
+const VALID_LOCATION_MODES: ReadonlySet<string> = new Set(["NONE", "LOCAL"]);
+const VALID_LEVEL_DISH_MODES: ReadonlySet<string> = new Set(["TILT_LIKE_NORMAL", "FORCE_LEVEL"]);
+const DISH_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "snowMeltMode",
+  "locationRequestMode",
+  "levelDishMode",
+  "powerSaveStartMinutes",
+  "powerSaveDurationMinutes",
+  "powerSaveMode",
+  "swupdateRebootHour",
+  "swupdateThreeDayDeferralEnabled",
+]);
 
 const AUTH_URL = "https://api.starlink.com/auth-rp/auth/user";
 const API = "https://starlink.com/api";
@@ -55,6 +70,8 @@ export interface CloudHandlerOptions {
    *  (custom DNS today; bypass mode and content filtering once each has had
    *  its own careful verification -- see routerWifiConfigUpdate.ts). */
   prepareWifiConfigUpdate?: (update: RouterWifiConfigUpdate) => Promise<Uint8Array>;
+  /** Same trust boundary again, for the dish itself -- see dishConfigUpdate.ts. */
+  prepareDishUpdate?: (update: DishUpdate) => Promise<Uint8Array>;
 }
 
 /** The durable half of the session — without it a token refresh can't happen, so
@@ -140,6 +157,7 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
   const deviceCallTimeoutMs = options.deviceCallTimeoutMs ?? 15_000;
   const prepareDeviceUpdate = options.prepareDeviceUpdate;
   const prepareWifiConfigUpdate = options.prepareWifiConfigUpdate;
+  const prepareDishUpdate = options.prepareDishUpdate;
 
   let cachedCookie: string | null = null;
   let cachedAt = 0;
@@ -566,5 +584,96 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     return mutation;
   }
 
-  return { handle, connect, disconnect, updateClient, updateWifiConfig };
+  /** Every key here must be a real DishConfigJson field the dish accepts --
+   *  the renderer names a change, never protobuf, same trust boundary as the
+   *  router validators above. */
+  function validDishConfigChanges(changes: DishConfigJson): boolean {
+    if (typeof changes !== "object" || changes === null) return false;
+    if (!Object.keys(changes).every((key) => DISH_CONFIG_KEYS.has(key))) return false;
+    return (
+      (changes.snowMeltMode === undefined || VALID_SNOW_MELT_MODES.has(changes.snowMeltMode)) &&
+      (changes.locationRequestMode === undefined ||
+        VALID_LOCATION_MODES.has(changes.locationRequestMode)) &&
+      (changes.levelDishMode === undefined || VALID_LEVEL_DISH_MODES.has(changes.levelDishMode)) &&
+      (changes.powerSaveStartMinutes === undefined ||
+        (Number.isInteger(changes.powerSaveStartMinutes) &&
+          changes.powerSaveStartMinutes >= 0 &&
+          changes.powerSaveStartMinutes < 1440)) &&
+      (changes.powerSaveDurationMinutes === undefined ||
+        (Number.isInteger(changes.powerSaveDurationMinutes) &&
+          changes.powerSaveDurationMinutes > 0 &&
+          changes.powerSaveDurationMinutes <= 1440)) &&
+      (changes.powerSaveMode === undefined || typeof changes.powerSaveMode === "boolean") &&
+      (changes.swupdateRebootHour === undefined ||
+        (Number.isInteger(changes.swupdateRebootHour) &&
+          changes.swupdateRebootHour >= 0 &&
+          changes.swupdateRebootHour < 24)) &&
+      (changes.swupdateThreeDayDeferralEnabled === undefined ||
+        typeof changes.swupdateThreeDayDeferralEnabled === "boolean")
+    );
+  }
+
+  function validDishUpdate(update: DishUpdate): boolean {
+    if (update?.kind === "config")
+      return validDishConfigChanges(update.changes) && Object.keys(update.changes).length > 0;
+    if (update?.kind === "stow") return typeof update.unstow === "boolean";
+    if (update?.kind === "clearObstructionMap") return true;
+    return false;
+  }
+
+  async function applyDishUpdate(update: DishUpdate): Promise<CloudResult> {
+    if (!readCookie()) return NOT_CONNECTED;
+    try {
+      if (!prepareDishUpdate) return { status: 503, body: { error: "dish_update_unavailable" } };
+      const requestBytes = await prepareDishUpdate(update);
+      const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
+      await withFreshCookie(async (cookie) => {
+        try {
+          await grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
+            fetch: doFetch,
+            headers: { cookie },
+          });
+        } catch (error) {
+          if (error instanceof GrpcWebError && error.grpcStatus === 16)
+            throw new SessionExpiredError();
+          throw error;
+        }
+      }, abortSignal);
+      return { status: 200, body: { ok: true } };
+    } catch (error) {
+      if (error instanceof SessionExpiredError) return NOT_CONNECTED;
+      if (error instanceof DOMException && error.name === "TimeoutError") {
+        return {
+          status: 504,
+          body: {
+            error: "device_call_timeout",
+            message: "Starlink did not answer the dish update in time. Try again.",
+          },
+        };
+      }
+      return {
+        status: 502,
+        body: { error: "device_call_failed", message: (error as Error).message },
+      };
+    }
+  }
+
+  /** Shares deviceMutationTail with the router mutations above. The dish is a
+   *  different device and DishConfig has no shared repeated field the way
+   *  WifiConfig's networks[] does, so nothing here strictly needs to queue
+   *  behind a router write -- but one shared queue for every device mutation
+   *  keeps the model simple and avoids firing concurrent calls at the same
+   *  cloud Device.Handle endpoint. */
+  function updateDishConfig(update: DishUpdate): Promise<CloudResult> {
+    if (!validDishUpdate(update)) return Promise.resolve({ status: 400, body: { error: "bad_request" } });
+
+    const mutation = deviceMutationTail.then(() => applyDishUpdate(update));
+    deviceMutationTail = mutation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return mutation;
+  }
+
+  return { handle, connect, disconnect, updateClient, updateWifiConfig, updateDishConfig };
 }
