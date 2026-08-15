@@ -1,7 +1,7 @@
 // Drill-in for one client device: identity header with rename, the spec sheet,
 // and its throughput charts.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { throughputMbps, type WifiClientJson } from "@core/dishClient";
 import { usageKey, type ClientUsageTotal } from "@core/clientUsage";
 import type { TelemetrySample } from "@core/telemetry";
@@ -17,6 +17,29 @@ import { DeviceThroughput } from "./DeviceThroughput";
 import { buildDeviceFacts } from "./deviceFacts";
 import { deviceRowSubtitle } from "./deviceRowSubtitle";
 import { displayName, signalQuality } from "./networkFormat";
+import { Button } from "../ui/button";
+import {
+  AccountRequiredError,
+  clientPauseControlAvailable,
+  setRouterClientPaused,
+} from "../../lib/routerClientUpdate";
+import { AccountRequiredNotice } from "../shared/AccountRequiredNotice";
+import { useCloudAccount } from "../../hooks/useCloudAccount";
+import { supportsRouterClientPause } from "../../lib/cloudHost";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../ui/dialog";
+
+// The router's client roster is what says whether a pause landed, and it is polled
+// on its own 5s cadence. Holding the control pending until that roster agrees is
+// what keeps the label from flicking back through its old value in between. The
+// timeout is the backstop for a write the gateway accepts but never applies.
+const PAUSE_SETTLE_TIMEOUT_MS = 20_000;
 
 export function DeviceDetail({
   client,
@@ -25,6 +48,7 @@ export function DeviceDetail({
   total,
   upstreamName,
   isThisDevice,
+  viewerIdentified,
   onRename,
 }: {
   client: WifiClientJson;
@@ -37,9 +61,54 @@ export function DeviceDetail({
   upstreamName?: string;
   /** True when this is the device viewing the dashboard. */
   isThisDevice: boolean;
-  onRename: (macAddress: string, givenName: string) => Promise<void>;
+  /** Whether the viewer's own device could be resolved at all. False makes
+   *  `isThisDevice` meaningless, since nothing can match an unknown identity. */
+  viewerIdentified: boolean;
+  onRename: (clientId: number, givenName: string) => Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
+  const [pendingPaused, setPendingPaused] = useState<boolean | null>(null);
+  const [confirmingPause, setConfirmingPause] = useState(false);
+  const [pauseError, setPauseError] = useState<Error | null>(null);
+  const paused = client.blocked === true;
+  // The roster agreeing with what was asked is what ends the pending state, and
+  // adjusting it here rather than in an effect keeps the label from rendering one
+  // frame of the stale value first.
+  if (pendingPaused !== null && paused === pendingPaused) setPendingPaused(null);
+  const pauseBusy = pendingPaused !== null && paused !== pendingPaused;
+  const { status: cloudStatus } = useCloudAccount(true);
+  const showPauseControl = clientPauseControlAvailable({
+    clientId: client.clientId,
+    isThisDevice,
+    viewerIdentified,
+    cloudConnected: cloudStatus === "ready",
+    hostSupportsPause: supportsRouterClientPause(),
+  });
+
+  useEffect(() => {
+    if (pendingPaused === null) return;
+    const timer = window.setTimeout(() => {
+      setPendingPaused(null);
+      setPauseError(
+        new Error("The router has not applied this yet. Give it a moment, then try again."),
+      );
+    }, PAUSE_SETTLE_TIMEOUT_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [pendingPaused]);
+
+  const applyPaused = async (next: boolean) => {
+    if (client.clientId === undefined || pauseBusy || !showPauseControl) return;
+    setPendingPaused(next);
+    setPauseError(null);
+    try {
+      await setRouterClientPaused(client.clientId, next);
+    } catch (error) {
+      setPendingPaused(null);
+      setPauseError(error as Error);
+    }
+  };
 
   const quality = signalQuality(client);
   const name = displayName(client);
@@ -95,11 +164,77 @@ export function DeviceDetail({
               {client.clientId}
             </span>
           )}
-          {client.blocked && <Badge className='mt-1'>Paused</Badge>}
+          {paused && <Badge className='mt-1'>Paused</Badge>}
         </div>
-        {/* Empty flank balances the left one so the glyph column stays centred. */}
-        <div aria-hidden />
+        <div className='flex justify-end'>
+          {showPauseControl && (
+            <Button
+              variant={paused ? "outline" : "secondary"}
+              size='sm'
+              className='cursor-pointer disabled:cursor-not-allowed'
+              disabled={pauseBusy}
+              onClick={() => {
+                if (paused) void applyPaused(false);
+                else setConfirmingPause(true);
+              }}
+            >
+              {pauseBusy
+                ? pendingPaused
+                  ? "Pausing…"
+                  : "Unpausing…"
+                : paused
+                  ? "Unpause"
+                  : "Pause"}
+            </Button>
+          )}
+        </div>
       </div>
+
+      {/* Pausing is confirmed, unpausing is not: only one of the two takes a device
+          off the internet, and the way back is not obvious from the device itself. */}
+      <Dialog open={confirmingPause} onOpenChange={setConfirmingPause}>
+        <DialogContent
+          showCloseButton={false}
+          className='gap-3 border-border/50 sm:max-w-md'
+          overlayClassName='bg-black/30 backdrop-blur-[2px]'
+        >
+          <DialogHeader>
+            <DialogTitle className='text-[19px] leading-snug'>Pause “{name}”?</DialogTitle>
+            <DialogDescription className='text-[13.5px] leading-relaxed'>
+              This will pause internet access for this device. It stays connected to your network,
+              and you can unpause it at any time.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className='mt-2 gap-2'>
+            <Button
+              variant='outline'
+              className='cursor-pointer sm:min-w-28'
+              onClick={() => setConfirmingPause(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              className='cursor-pointer sm:min-w-28'
+              onClick={() => {
+                setConfirmingPause(false);
+                void applyPaused(true);
+              }}
+            >
+              Pause
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {pauseError && (
+        <div className='mb-3 rounded-md border border-destructive/30 bg-destructive/8 px-3 py-2 text-[12px] text-destructive'>
+          {pauseError instanceof AccountRequiredError ? (
+            <AccountRequiredNotice />
+          ) : (
+            pauseError.message
+          )}
+        </div>
+      )}
 
       {editing && (
         <DeviceNameEditor

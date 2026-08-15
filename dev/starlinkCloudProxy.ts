@@ -12,6 +12,10 @@ import { resolve } from "node:path";
 import type { Plugin } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createCloudHandler } from "../cloud/starlinkCloudHandler.ts";
+import { DishClient, ROUTER_LAN_HANDLE_URL } from "../core/dishClient.ts";
+import { prepareRouterClientUpdate } from "../core/routerClientUpdate.ts";
+import type { RouterClientUpdate } from "../core/routerClientUpdate.ts";
+import { localNetworkIdentity } from "../core/hostNetworkIdentity.ts";
 
 const COOKIE_FILE = resolve(process.cwd(), ".starlink-cookie");
 
@@ -41,6 +45,19 @@ function sendJson(res: ServerResponse, status: number, payload: unknown) {
   res.end(JSON.stringify(payload));
 }
 
+// A text/plain POST is a CORS simple request: no preflight, so a page on any site
+// lands the write without ever reading the reply. Loopback binding is no defence,
+// the request comes from a browser on this machine.
+function isLocalOrigin(origin?: string): boolean {
+  if (!origin) return true;
+  try {
+    const { hostname } = new URL(origin);
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  } catch {
+    return false;
+  }
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolveBody, reject) => {
     let data = "";
@@ -56,10 +73,26 @@ export function starlinkCloudProxy(): Plugin {
   return {
     name: "starlink-cloud-proxy",
     configureServer(server) {
-      const handler = createCloudHandler({ readCookie, writeCookie, clearCookie });
+      let routerPromise: Promise<DishClient> | null = null;
+      const handler = createCloudHandler({
+        readCookie,
+        writeCookie,
+        clearCookie,
+        prepareDeviceUpdate: async (update) => {
+          routerPromise ??= DishClient.load("router", {
+            handleUrl: ROUTER_LAN_HANDLE_URL,
+            protosetBytes: new Uint8Array(
+              readFileSync(resolve(process.cwd(), "public/dish.protoset")),
+            ),
+          });
+          return prepareRouterClientUpdate(await routerPromise, update, localNetworkIdentity());
+        },
+      });
       server.middlewares.use(async (req: IncomingMessage, res: ServerResponse, next) => {
         const url = req.url ?? "";
         if (!url.startsWith("/cloud/")) return next();
+        if (!isLocalOrigin(req.headers.origin))
+          return sendJson(res, 403, { error: "forbidden_origin" });
         const route = url.split("?")[0];
 
         // Connect / disconnect the session pasted from the UI.
@@ -81,6 +114,16 @@ export function starlinkCloudProxy(): Plugin {
             }
           }
           return sendJson(res, 405, { error: "method_not_allowed" });
+        }
+
+        if (route === "/cloud/device" && req.method === "POST") {
+          try {
+            const update = JSON.parse((await readBody(req)) || "{}") as RouterClientUpdate;
+            const result = await handler.updateClient(update);
+            return sendJson(res, result.status, result.body);
+          } catch (error) {
+            return sendJson(res, 400, { error: "bad_request", message: (error as Error).message });
+          }
         }
 
         const { status, body } = await handler.handle(route);

@@ -21,6 +21,7 @@ export function setApiBase(base: string): void {
  *  collidable with another router's default. lib/routerDiagnosis turns a failure
  *  to reach it into the one wording every surface reports. */
 export const ROUTER_LAN_ADDRESS = "192.168.1.1";
+export const ROUTER_LAN_HANDLE_URL = `http://${ROUTER_LAN_ADDRESS}:9001/SpaceX.API.Device.Device/Handle`;
 
 /**
  * @deprecated No-op kept only so the Electron/extension entry points (which
@@ -263,13 +264,32 @@ export interface WifiNetworkConfigJson {
   countryCode?: string;
   networks?: WifiLanNetworkJson[];
   meshConfigs?: Record<string, WifiMeshNodeJson>;
-  clientConfigs?: Array<{ clientId?: number; macAddress?: string; givenName?: string }>;
+  clientConfigs?: WifiClientConfigJson[];
   boot?: { evenSideSoftwareVersion?: string; oddSideSoftwareVersion?: string; lastReason?: string };
   /** Disables the router's own WiFi in favor of a third-party router on its
    *  ethernet port. Read-only here -- see setBypassMode's own risk note. */
   bypassMode?: boolean;
   nameservers?: string[];
   customDnsDisabled?: boolean;
+  [key: string]: unknown;
+}
+
+export interface WifiBlockRangeJson {
+  startMinutes?: number;
+  endMinutes?: number;
+}
+
+export interface WifiWeeklyBlockScheduleJson {
+  blockRanges?: WifiBlockRangeJson[];
+  groupId?: string;
+}
+
+export interface WifiClientConfigJson {
+  clientId?: number;
+  macAddress?: string;
+  givenName?: string;
+  weeklyBlockSchedules?: WifiWeeklyBlockScheduleJson[];
+  groupId?: string;
   [key: string]: unknown;
 }
 
@@ -401,9 +421,19 @@ export interface RadioStatsJson {
 export class DishClient {
   private constructor(private readonly target: "dish" | "router") {}
 
-  /** No network round-trip needed anymore (no protoset to fetch) -- async only
-   *  to keep every call site that awaits DishClient.load(...) unchanged. */
-  static async load(target: "dish" | "router" = "dish"): Promise<DishClient> {
+  /**
+   * No network round-trip needed anymore (no protoset to fetch) -- async only
+   * to keep every call site that awaits DishClient.load(...) unchanged.
+   *
+   * `options` is accepted-but-ignored for compatibility with the Electron/
+   * extension entry points, which still pass a grpc-web host binding during
+   * their own bootstrap (see setDishHost's own note) -- this web target talks
+   * to our FastAPI backend instead, so there's nothing here to configure.
+   */
+  static async load(
+    target: "dish" | "router" = "dish",
+    _options: { handleUrl?: string; protosetUrl?: string; protosetBytes?: Uint8Array } = {},
+  ): Promise<DishClient> {
     return new DishClient(target);
   }
 
@@ -459,6 +489,15 @@ export class DishClient {
    *  no-op RPC on electronically-steered kits (this network's Mini). */
   async stow(unstow: boolean, abortSignal?: AbortSignal): Promise<void> {
     await apiPost(`/stow?unstow=${unstow}`, undefined, abortSignal);
+  }
+
+  /** Encode a Device.Request for an authenticated host to send through the cloud
+   *  gateway. This does not perform a local router write. */
+  encodeRequest(requestJson: object): Uint8Array {
+    return toBinary(
+      this.requestSchema,
+      fromJson(this.requestSchema, requestJson as JsonValue, { registry: this.registry }),
+    );
   }
 
   /** Current dish configuration (sleep schedule, snow melt, update window …). */

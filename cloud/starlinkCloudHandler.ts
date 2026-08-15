@@ -7,8 +7,12 @@
 // This is separate from the historian on purpose: cloud data needs only the
 // internet and a cookie, and must not depend on the dish poller's health.
 
+import { GrpcWebError, grpcWebUnaryCall } from "../core/grpcWeb";
+import type { RouterClientUpdate } from "../core/routerClientUpdate";
+
 const AUTH_URL = "https://api.starlink.com/auth-rp/auth/user";
 const API = "https://starlink.com/api";
+const DEVICE_HANDLE = `${API}/SpaceX.API.Device.Device/Handle`;
 const REFRESH_TTL_MS = 60_000; // the Access.V1 token is short-lived; refresh at most this often
 const IDS_TTL_MS = 5 * 60_000; // account/service-line numbers change ~never; cache across routes
 
@@ -39,6 +43,11 @@ export interface CloudHandlerOptions {
    *  microseconds earlier is not reliably applied to the very next worker fetch;
    *  the pause gives it a beat to take. Injected so tests retry without waiting. */
   retryDelayMs?: number;
+  /** Maximum time for each remote router mutation attempt. */
+  deviceCallTimeoutMs?: number;
+  /** Trusted host callback: reads the local router and encodes exactly one
+   *  client update. Renderer-provided protobuf is never accepted. */
+  prepareDeviceUpdate?: (update: RouterClientUpdate) => Promise<Uint8Array>;
 }
 
 /** The durable half of the session — without it a token refresh can't happen, so
@@ -49,7 +58,7 @@ const NOT_CONNECTED: CloudResult = {
   status: 428,
   body: {
     error: "not_connected",
-    message: "No Starlink session — sign in to connect your account.",
+    message: "An authorized account is required — sign in to use this feature.",
   },
 };
 
@@ -121,12 +130,15 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
   const writeCookie = options.writeCookie ?? (() => {});
   const clearCookie = options.clearCookie ?? (() => {});
   const retryDelayMs = options.retryDelayMs ?? 150;
+  const deviceCallTimeoutMs = options.deviceCallTimeoutMs ?? 15_000;
+  const prepareDeviceUpdate = options.prepareDeviceUpdate;
 
   let cachedCookie: string | null = null;
   let cachedAt = 0;
   let refreshInFlight: Promise<string | null> | null = null;
   let cachedIds: { acc: string; sl: string } | null = null;
   let cachedIdsAt = 0;
+  let deviceMutationTail: Promise<void> = Promise.resolve();
 
   function forgetSession() {
     cachedCookie = null;
@@ -139,31 +151,37 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
    *  without it). `force` busts the 60s cache after a mid-flight token expiry.
    *  Concurrent callers share one in-flight refresh so opening a surface fires
    *  one auth/user. */
-  async function freshCookie(force = false): Promise<string | null> {
+  async function freshCookie(force = false, abortSignal?: AbortSignal): Promise<string | null> {
     const base = readCookie();
     if (!base) return null;
     if (!force && cachedCookie && Date.now() - cachedAt < REFRESH_TTL_MS) return cachedCookie;
-    if (!force && refreshInFlight) return refreshInFlight;
+    if (!force && refreshInFlight && !abortSignal) return refreshInFlight;
 
-    refreshInFlight = (async () => {
-      try {
-        const authResponse = await doFetch(AUTH_URL, { headers: { cookie: base } });
-        // A dead SSO session answers the refresh itself with 401/403 — that's a
-        // reconnect, not an upstream failure. Surface it as such.
-        if (authResponse.status === 401 || authResponse.status === 403) {
-          forgetSession();
-          throw new SessionExpiredError();
-        }
-        const setCookie = authResponse.headers.get("set-cookie") ?? "";
-        const match = setCookie.match(/Starlink\.Com\.Access\.V1=([^;]+)/);
-        const withoutOld = base.replace(/Starlink\.Com\.Access\.V1=[^;]*;?/g, "").trim();
-        cachedCookie = match ? `Starlink.Com.Access.V1=${match[1]};${withoutOld}` : base;
-        cachedAt = Date.now();
-        return cachedCookie;
-      } finally {
-        refreshInFlight = null;
+    const refresh = (async () => {
+      const authResponse = await doFetch(AUTH_URL, {
+        headers: { cookie: base },
+        signal: abortSignal,
+      });
+      // A dead SSO session answers the refresh itself with 401/403 — that's a
+      // reconnect, not an upstream failure. Surface it as such.
+      if (authResponse.status === 401 || authResponse.status === 403) {
+        forgetSession();
+        throw new SessionExpiredError();
       }
+      const setCookie = authResponse.headers.get("set-cookie") ?? "";
+      const match = setCookie.match(/Starlink\.Com\.Access\.V1=([^;]+)/);
+      const withoutOld = base.replace(/Starlink\.Com\.Access\.V1=[^;]*;?/g, "").trim();
+      cachedCookie = match ? `Starlink.Com.Access.V1=${match[1]};${withoutOld}` : base;
+      cachedAt = Date.now();
+      return cachedCookie;
     })();
+
+    // Bounded mutations use their own abortable refresh rather than inheriting
+    // an unrelated, potentially stalled shared read request.
+    if (abortSignal) return refresh;
+    refreshInFlight = refresh.finally(() => {
+      refreshInFlight = null;
+    });
     return refreshInFlight;
   }
 
@@ -176,9 +194,12 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
    *  and try once more. A genuinely dead session throws again on that retry and
    *  surfaces as not-connected. The initial refresh is inside the retry because
    *  that first auth/user is exactly where the late cookie bites. */
-  async function withFreshCookie<T>(run: (cookie: string) => Promise<T>): Promise<T> {
+  async function withFreshCookie<T>(
+    run: (cookie: string) => Promise<T>,
+    abortSignal?: AbortSignal,
+  ): Promise<T> {
     const attempt = async (force: boolean): Promise<T> => {
-      const cookie = await freshCookie(force);
+      const cookie = await freshCookie(force, abortSignal);
       if (!cookie) throw new SessionExpiredError();
       return run(cookie);
     };
@@ -337,5 +358,83 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     return { status: 200, body: { ok: true } };
   }
 
-  return { handle, connect, disconnect };
+  async function applyClientUpdate(update: RouterClientUpdate): Promise<CloudResult> {
+    if (!readCookie()) return NOT_CONNECTED;
+    try {
+      // This callback reads the full client-config list. Keep preparation and
+      // the corresponding write in one serialized critical section so a later
+      // mutation cannot be built from a snapshot predating an earlier write.
+      if (!prepareDeviceUpdate)
+        return { status: 503, body: { error: "device_update_unavailable" } };
+      const requestBytes = await prepareDeviceUpdate(update);
+      const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
+      await withFreshCookie(async (cookie) => {
+        try {
+          await grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
+            fetch: doFetch,
+            headers: { cookie },
+          });
+        } catch (error) {
+          if (error instanceof GrpcWebError && error.grpcStatus === 16)
+            throw new SessionExpiredError();
+          throw error;
+        }
+      }, abortSignal);
+      return { status: 200, body: { ok: true } };
+    } catch (error) {
+      if (error instanceof SessionExpiredError) return NOT_CONNECTED;
+      if (error instanceof DOMException && error.name === "TimeoutError") {
+        return {
+          status: 504,
+          body: {
+            error: "device_call_timeout",
+            message: "Starlink did not answer the device update in time. Try again.",
+          },
+        };
+      }
+      return {
+        status: 502,
+        body: { error: "device_call_failed", message: (error as Error).message },
+      };
+    }
+  }
+
+  /** The renderer names a device and a change, never protobuf. Anything outside
+   *  these shapes is refused before the router is read. */
+  function validUpdate(update: RouterClientUpdate): boolean {
+    if (update?.kind === "pause")
+      return (
+        Number.isInteger(update.clientId) &&
+        update.clientId >= 0 &&
+        update.clientId <= 0xffff_ffff &&
+        typeof update.paused === "boolean"
+      );
+    if (update?.kind === "rename")
+      return (
+        Number.isInteger(update.clientId) &&
+        update.clientId >= 0 &&
+        update.clientId <= 0xffff_ffff &&
+        typeof update.givenName === "string" &&
+        update.givenName.trim().length > 0 &&
+        update.givenName.length <= 64
+      );
+    return false;
+  }
+
+  /** Every update rewrites the router's whole client list, so two in flight would
+   *  each be built from a snapshot predating the other. One queue for all of them. */
+  function updateClient(update: RouterClientUpdate): Promise<CloudResult> {
+    if (!validUpdate(update))
+      return Promise.resolve({ status: 400, body: { error: "bad_request" } });
+
+    const mutation = deviceMutationTail.then(() => applyClientUpdate(update));
+    // A rejected mutation must not poison the queue for every later device.
+    deviceMutationTail = mutation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return mutation;
+  }
+
+  return { handle, connect, disconnect, updateClient };
 }

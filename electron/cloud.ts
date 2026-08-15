@@ -9,6 +9,10 @@ import { app, safeStorage, BrowserWindow, session } from "electron";
 import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createCloudHandler } from "../cloud/starlinkCloudHandler";
+import { DishClient, ROUTER_LAN_HANDLE_URL } from "../core/dishClient";
+import { prepareRouterClientUpdate } from "../core/routerClientUpdate";
+import type { RouterClientUpdate } from "../core/routerClientUpdate";
+import { localNetworkIdentity } from "../core/hostNetworkIdentity";
 
 const LOGIN_URL = "https://www.starlink.com/account";
 // The login window gets its own session, so signing out can wipe its Starlink
@@ -46,9 +50,24 @@ function clearCookie(): void {
 }
 
 /** Create the cloud client once, after the app is ready (the data path needs it). */
-export function startCloud(): void {
+export function startCloud(rendererRoot: string): void {
   cookieFile = join(app.getPath("userData"), "starlink-session.bin");
-  handler = createCloudHandler({ readCookie, writeCookie, clearCookie });
+  const protosetPath = app.isPackaged
+    ? join(rendererRoot, "dish.protoset")
+    : join(app.getAppPath(), "public/dish.protoset");
+  let routerPromise: Promise<DishClient> | null = null;
+  handler = createCloudHandler({
+    readCookie,
+    writeCookie,
+    clearCookie,
+    prepareDeviceUpdate: async (update) => {
+      routerPromise ??= DishClient.load("router", {
+        handleUrl: ROUTER_LAN_HANDLE_URL,
+        protosetBytes: new Uint8Array(readFileSync(protosetPath)),
+      });
+      return prepareRouterClientUpdate(await routerPromise, update, localNetworkIdentity());
+    },
+  });
 }
 
 function json(status: number, body: unknown): Response {
@@ -77,6 +96,12 @@ export async function handleCloudRequest(request: Request): Promise<Response> {
       return json(status, body);
     }
     return json(405, { error: "method_not_allowed" });
+  }
+
+  if (route === "/cloud/device" && request.method === "POST") {
+    const update = (await request.json().catch(() => ({}))) as RouterClientUpdate;
+    const { status, body } = await handler.updateClient(update);
+    return json(status, body);
   }
 
   const { status, body } = await handler.handle(route);
