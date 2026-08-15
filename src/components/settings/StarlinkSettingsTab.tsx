@@ -12,8 +12,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { DishClient, DishStatusJson, SnowMeltMode } from "@core/dishClient";
+import type { DishClient, DishConfigJson, DishStatusJson, SnowMeltMode } from "@core/dishClient";
 import type { useDishSettings } from "../../hooks/useDishSettings";
+import { useCloudAccount } from "../../hooks/useCloudAccount";
+import {
+  clearDishObstructionMapViaCloud,
+  setDishConfigViaCloud,
+  setDishStowViaCloud,
+} from "../../lib/dishConfigUpdate";
 import {
   DangerAction,
   SectionLabel,
@@ -58,10 +64,28 @@ export function StarlinkSettingsTab({
   const sleepDurationH = Math.round((config?.powerSaveDurationMinutes ?? 360) / 60);
   const updateWindow = updateWindowFor(config?.swupdateRebootHour);
 
-  // Every write is fire-and-forget with the failure swallowed: the hook already
-  // surfaces `settings.error`, and a rejected promise here would be unhandled.
-  const save = (patch: Parameters<typeof settings.save>[0]) =>
-    void settings.save(patch).catch(() => {});
+  // Every one of these writes through the connected Starlink account's cloud
+  // session, not the local network -- see settings.save's own note (still
+  // used for the initial read) on why: the dish confirmed PERMISSION_DENIED
+  // on every local write RPC on current firmware.
+  const cloudAccount = useCloudAccount(true);
+  const cloudConnected = cloudAccount.status === "ready";
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [saveResult, setSaveResult] = useState<{ field: string; message: string } | null>(null);
+  const noteFor = (field: string) => (saveResult?.field === field ? saveResult.message : undefined);
+
+  const save = (field: string, patch: DishConfigJson) => {
+    setCloudBusy(true);
+    setSaveResult(null);
+    void setDishConfigViaCloud(patch)
+      .then(() => setSaveResult({ field, message: "Saved — the dish will pick it up shortly." }))
+      .catch((error) => setSaveResult({ field, message: `Failed: ${(error as Error).message}` }))
+      .finally(() => {
+        setCloudBusy(false);
+        window.setTimeout(() => setSaveResult((r) => (r?.field === field ? null : r)), 4000);
+      });
+  };
+  const controlDisabled = cloudBusy || !cloudConnected;
 
   return (
     <>
@@ -71,14 +95,21 @@ export function StarlinkSettingsTab({
       {settings.error && <Callout tone='error'>{settings.error}</Callout>}
       {config && (
         <>
+          <Callout tone={cloudConnected ? "info" : "error"} className='mb-1'>
+            {cloudConnected
+              ? "These write through your connected Starlink account's cloud session, not the local network -- every local write RPC on this dish is confirmed blocked on current firmware (Permission denied)."
+              : "Confirmed blocked on current firmware (Permission denied on every local write RPC). Connect your Starlink account in the App tab to write these through the cloud instead."}
+          </Callout>
+
           <SettingRow
             title='Snow melt'
             caption="Heats the panel to shed snow. Auto uses the dish's own sensors."
+            note={noteFor("snowMelt")}
           >
             <Select
               value={config.snowMeltMode ?? "AUTO"}
-              disabled={settings.saving}
-              onValueChange={(mode) => save({ snowMeltMode: mode as SnowMeltMode })}
+              disabled={controlDisabled}
+              onValueChange={(mode) => save("snowMelt", { snowMeltMode: mode as SnowMeltMode })}
             >
               <SelectTrigger className={triggerClass} style={{ width: 118 }}>
                 <SelectValue />
@@ -100,12 +131,14 @@ export function StarlinkSettingsTab({
                 ? `Dish powers down daily at ${sleepStart} for ${sleepDurationH} h`
                 : "Power the dish down for part of every day"
             }
+            note={noteFor("sleep")}
           >
             <Switch
               checked={sleepEnabled}
-              disabled={settings.saving}
+              disabled={controlDisabled}
               onCheckedChange={(enabled) =>
                 save(
+                  "sleep",
                   enabled
                     ? {
                         powerSaveMode: true,
@@ -125,16 +158,18 @@ export function StarlinkSettingsTab({
                 type='time'
                 className='h-7 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink tabular-nums hover:border-input'
                 value={sleepStart}
-                disabled={settings.saving}
+                disabled={controlDisabled}
                 onChange={(event) =>
-                  save({ powerSaveStartMinutes: localTimeToUtcMinutes(event.target.value) })
+                  save("sleep", { powerSaveStartMinutes: localTimeToUtcMinutes(event.target.value) })
                 }
               />
               <span className='mt-px block text-[12px] text-muted-foreground'>for</span>
               <Select
                 value={String(sleepDurationH)}
-                disabled={settings.saving}
-                onValueChange={(hours) => save({ powerSaveDurationMinutes: Number(hours) * 60 })}
+                disabled={controlDisabled}
+                onValueChange={(hours) =>
+                  save("sleep", { powerSaveDurationMinutes: Number(hours) * 60 })
+                }
               >
                 <SelectTrigger className={triggerClass} style={{ width: 72 }}>
                   <SelectValue />
@@ -156,11 +191,12 @@ export function StarlinkSettingsTab({
           <SettingRow
             title='Software updates'
             caption={`Update reboots happen ${updateWindow.range.toLowerCase()}`}
+            note={noteFor("swupdate")}
           >
             <Select
               value={String(updateWindow.hour)}
-              disabled={settings.saving}
-              onValueChange={(hour) => save({ swupdateRebootHour: Number(hour) })}
+              disabled={controlDisabled}
+              onValueChange={(hour) => save("swupdate", { swupdateRebootHour: Number(hour) })}
             >
               <SelectTrigger className={triggerClass}>
                 <SelectValue />
@@ -179,23 +215,30 @@ export function StarlinkSettingsTab({
             </Select>
           </SettingRow>
 
-          <SettingRow title='Defer updates' caption='Hold firmware updates for up to 3 days'>
+          <SettingRow
+            title='Defer updates'
+            caption='Hold firmware updates for up to 3 days'
+            note={noteFor("swupdate")}
+          >
             <Switch
               checked={Boolean(config.swupdateThreeDayDeferralEnabled)}
-              disabled={settings.saving}
-              onCheckedChange={(enabled) => save({ swupdateThreeDayDeferralEnabled: enabled })}
+              disabled={controlDisabled}
+              onCheckedChange={(enabled) =>
+                save("swupdate", { swupdateThreeDayDeferralEnabled: enabled })
+              }
             />
           </SettingRow>
 
           <SettingRow
             title='Location sharing'
             caption='GPS access for the local API -- separately blocked by Starlink policy since mid-2026 regardless of this setting'
+            note={noteFor("location")}
           >
             <Select
               value={config.locationRequestMode ?? "LOCAL"}
-              disabled={settings.saving}
+              disabled={controlDisabled}
               onValueChange={(mode) =>
-                save({ locationRequestMode: mode as "LOCAL" | "NONE" })
+                save("location", { locationRequestMode: mode as "LOCAL" | "NONE" })
               }
             >
               <SelectTrigger className={triggerClass} style={{ width: 92 }}>
@@ -239,7 +282,7 @@ export function StarlinkSettingsTab({
             buttonLabel='Reset'
             confirmLabel='Yes, reset map'
             onRun={async () => {
-              await (await loadDish()).clearObstructionMap();
+              await clearDishObstructionMapViaCloud();
               return "Obstruction map cleared — the survey restarts now.";
             }}
           />
@@ -264,7 +307,7 @@ export function StarlinkSettingsTab({
               buttonLabel={status?.stowRequested ? "Unstow" : "Stow"}
               confirmLabel={status?.stowRequested ? "Yes, unstow" : "Yes, stow"}
               onRun={async () => {
-                await (await loadDish()).stow(Boolean(status?.stowRequested));
+                await setDishStowViaCloud(Boolean(status?.stowRequested));
                 return status?.stowRequested
                   ? "Unstow sent — deploying."
                   : "Stow sent — folding flat.";
