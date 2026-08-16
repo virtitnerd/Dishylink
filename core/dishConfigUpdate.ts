@@ -20,6 +20,7 @@ function dishConfigRequestFor(targetId: string, changes: DishConfigJson): DishCo
   if (!targetId.startsWith("ut")) throw new Error("invalid dish target id");
   const dishConfig: Record<string, unknown> = {};
   for (const [field, value] of Object.entries(changes)) {
+    if (value === undefined) continue;
     dishConfig[field] = value;
     dishConfig[`apply${field[0].toUpperCase()}${field.slice(1)}`] = true;
   }
@@ -43,24 +44,23 @@ export type DishUpdate =
 
 /** Trusted-host preparation, mirroring prepareRouterWifiConfigUpdate: source
  *  the target device id directly from the local dish immediately before
- *  encoding the cloud write. */
+ *  encoding the cloud write. Reads via getDeviceInfo rather than the fuller
+ *  getStatus -- all this needs is the id. */
 export async function prepareDishUpdate(
   dish: DishClient,
   update: DishUpdate,
 ): Promise<Uint8Array> {
-  const status = await dish.getStatus(AbortSignal.timeout(5_000));
-  const targetId = status.deviceInfo?.id;
+  const deviceInfo = await dish.getDeviceInfo(AbortSignal.timeout(5_000));
+  const targetId = deviceInfo.id;
   if (!targetId) throw new Error("Starlink dish identity is unavailable");
 
   if (update.kind === "config") {
     return dish.encodeRequest(dishConfigRequestFor(targetId, update.changes));
   }
   if (update.kind === "stow") {
-    if (!targetId.startsWith("ut")) throw new Error("invalid dish target id");
     return dish.encodeRequest({ targetId, dishStow: { unstow: update.unstow } });
   }
   if (update.kind === "clearObstructionMap") {
-    if (!targetId.startsWith("ut")) throw new Error("invalid dish target id");
     return dish.encodeRequest({ targetId, dishClearObstructionMap: {} });
   }
   throw new Error(`unhandled update kind`);

@@ -712,6 +712,11 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     return mutation;
   }
 
+  // The four windows the app itself offers for swupdate_reboot_hour (see
+  // updateWindowFor in the settings UI) — the field is a uint32, but only
+  // these values are ones a renderer should ever be allowed to send.
+  const SWUPDATE_REBOOT_HOURS = [3, 9, 15, 21];
+
   /** Every key here must be a real DishConfigJson field the dish accepts --
    *  the renderer names a change, never protobuf, same trust boundary as the
    *  router validators above. */
@@ -733,9 +738,7 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
           changes.powerSaveDurationMinutes <= 1440)) &&
       (changes.powerSaveMode === undefined || typeof changes.powerSaveMode === "boolean") &&
       (changes.swupdateRebootHour === undefined ||
-        (Number.isInteger(changes.swupdateRebootHour) &&
-          changes.swupdateRebootHour >= 0 &&
-          changes.swupdateRebootHour < 24)) &&
+        SWUPDATE_REBOOT_HOURS.includes(changes.swupdateRebootHour)) &&
       (changes.swupdateThreeDayDeferralEnabled === undefined ||
         typeof changes.swupdateThreeDayDeferralEnabled === "boolean")
     );

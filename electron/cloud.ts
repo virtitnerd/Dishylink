@@ -10,6 +10,8 @@ import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createCloudHandler } from "../cloud/starlinkCloudHandler";
 import { DishClient, ROUTER_LAN_HANDLE_URL } from "../core/dishClient";
+import { prepareDishUpdate } from "../core/dishConfigUpdate";
+import type { DishUpdate } from "../core/dishConfigUpdate";
 import { prepareRouterClientUpdate } from "../core/routerClientUpdate";
 import type { RouterClientUpdate } from "../core/routerClientUpdate";
 import { localNetworkIdentity } from "../core/hostNetworkIdentity";
@@ -56,6 +58,7 @@ export function startCloud(rendererRoot: string): void {
     ? join(rendererRoot, "dish.protoset")
     : join(app.getAppPath(), "public/dish.protoset");
   let routerPromise: Promise<DishClient> | null = null;
+  let dishPromise: Promise<DishClient> | null = null;
   handler = createCloudHandler({
     readCookie,
     writeCookie,
@@ -66,6 +69,12 @@ export function startCloud(rendererRoot: string): void {
         protosetBytes: new Uint8Array(readFileSync(protosetPath)),
       });
       return prepareRouterClientUpdate(await routerPromise, update, localNetworkIdentity());
+    },
+    prepareDishUpdate: async (update) => {
+      dishPromise ??= DishClient.load("dish", {
+        protosetBytes: new Uint8Array(readFileSync(protosetPath)),
+      });
+      return prepareDishUpdate(await dishPromise, update);
     },
   });
 }
@@ -101,6 +110,12 @@ export async function handleCloudRequest(request: Request): Promise<Response> {
   if (route === "/cloud/device" && request.method === "POST") {
     const update = (await request.json().catch(() => ({}))) as RouterClientUpdate;
     const { status, body } = await handler.updateClient(update);
+    return json(status, body);
+  }
+
+  if (route === "/cloud/dish-config" && request.method === "POST") {
+    const update = (await request.json().catch(() => ({}))) as DishUpdate;
+    const { status, body } = await handler.updateDishConfig(update);
     return json(status, body);
   }
 

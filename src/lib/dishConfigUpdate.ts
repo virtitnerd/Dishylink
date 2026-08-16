@@ -17,14 +17,22 @@ export async function applyDishConfigUpdate(
   throw new Error(`Starlink rejected the dish update: ${message}`);
 }
 
-export async function setDishConfigViaCloud(changes: DishConfigJson): Promise<void> {
-  await applyDishConfigUpdate({ kind: "config", changes });
+export async function setDishConfigViaCloud(
+  changes: DishConfigJson,
+  request?: (request: CloudRequest) => Promise<CloudReply>,
+): Promise<void> {
+  await applyDishConfigUpdate({ kind: "config", changes }, request);
 }
 
-export async function setDishStowViaCloud(unstow: boolean): Promise<void> {
-  await applyDishConfigUpdate({ kind: "stow", unstow });
+export async function setDishStowViaCloud(
+  unstow: boolean,
+  request?: (request: CloudRequest) => Promise<CloudReply>,
+): Promise<void> {
+  await applyDishConfigUpdate({ kind: "stow", unstow }, request);
 }
 
-export async function clearDishObstructionMapViaCloud(): Promise<void> {
-  await applyDishConfigUpdate({ kind: "clearObstructionMap" });
+export async function clearDishObstructionMapViaCloud(
+  request?: (request: CloudRequest) => Promise<CloudReply>,
+): Promise<void> {
+  await applyDishConfigUpdate({ kind: "clearObstructionMap" }, request);
 }

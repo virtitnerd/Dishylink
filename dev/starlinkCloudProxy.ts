@@ -87,6 +87,8 @@ export function starlinkCloudProxy(): Plugin {
       setApiBase("http://127.0.0.1:8787/api");
       let routerPromise: Promise<DishClient> | null = null;
       let dishPromise: Promise<DishClient> | null = null;
+      const protosetBytes = () =>
+        new Uint8Array(readFileSync(resolve(process.cwd(), "public/dish.protoset")));
       const handler = createCloudHandler({
         readCookie,
         writeCookie,
@@ -94,27 +96,19 @@ export function starlinkCloudProxy(): Plugin {
         prepareDeviceUpdate: async (update) => {
           routerPromise ??= DishClient.load("router", {
             handleUrl: ROUTER_LAN_HANDLE_URL,
-            protosetBytes: new Uint8Array(
-              readFileSync(resolve(process.cwd(), "public/dish.protoset")),
-            ),
+            protosetBytes: protosetBytes(),
           });
           return prepareRouterClientUpdate(await routerPromise, update, localNetworkIdentity());
         },
         prepareWifiConfigUpdate: async (update) => {
           routerPromise ??= DishClient.load("router", {
             handleUrl: ROUTER_LAN_HANDLE_URL,
-            protosetBytes: new Uint8Array(
-              readFileSync(resolve(process.cwd(), "public/dish.protoset")),
-            ),
+            protosetBytes: protosetBytes(),
           });
           return prepareRouterWifiConfigUpdate(await routerPromise, update);
         },
         prepareDishUpdate: async (update) => {
-          dishPromise ??= DishClient.load("dish", {
-            protosetBytes: new Uint8Array(
-              readFileSync(resolve(process.cwd(), "public/dish.protoset")),
-            ),
-          });
+          dishPromise ??= DishClient.load("dish", { protosetBytes: protosetBytes() });
           return prepareDishUpdate(await dishPromise, update);
         },
       });

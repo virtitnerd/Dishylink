@@ -332,3 +332,111 @@ describe("createCloudHandler pauseClient", () => {
     expect(prepared).toBe(false);
   });
 });
+
+describe("createCloudHandler updateDishConfig", () => {
+  it("given: a trusted host request, should: send framed protobuf with its cookie", async () => {
+    const request = new Uint8Array([8, 1, 18, 0]);
+    const responseMessage = new Uint8Array([10, 0]);
+    const responseFrame = new Uint8Array([0, 0, 0, 0, responseMessage.length, ...responseMessage]);
+    const captured: { url: string; init?: RequestInit } = { url: "" };
+    const doFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === AUTH_URL) return res(200);
+      captured.url = url;
+      captured.init = init;
+      return {
+        status: 200,
+        ok: true,
+        headers: { get: () => null },
+        arrayBuffer: async () => responseFrame.buffer,
+      } as unknown as Response;
+    }) as typeof fetch;
+    const handler = createCloudHandler({
+      fetch: doFetch,
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      prepareDishUpdate: async (update) => {
+        expect(update).toEqual({ kind: "config", changes: { swupdateRebootHour: 15 } });
+        return request;
+      },
+    });
+
+    await expect(
+      handler.updateDishConfig({ kind: "config", changes: { swupdateRebootHour: 15 } }),
+    ).resolves.toEqual({
+      status: 200,
+      body: { ok: true },
+    });
+    expect(captured.url).toBe("https://starlink.com/api/SpaceX.API.Device.Device/Handle");
+    const headers = captured.init?.headers as Record<string, string>;
+    expect(headers.cookie).toBe(SESSION);
+    expect(new Uint8Array(captured.init?.body as ArrayBufferLike)).toEqual(
+      new Uint8Array([0, 0, 0, 0, request.length, ...request]),
+    );
+  });
+
+  it("given: no session, should: return the reconnect response without preparing a request", async () => {
+    let prepared = false;
+    const handler = createCloudHandler({
+      readCookie: () => null,
+      prepareDishUpdate: async () => {
+        prepared = true;
+        return new Uint8Array();
+      },
+    });
+
+    await expect(
+      handler.updateDishConfig({ kind: "config", changes: { swupdateThreeDayDeferralEnabled: true } }),
+    ).resolves.toMatchObject({ status: 428 });
+    expect(prepared).toBe(false);
+  });
+
+  it("given: the device gateway stalls, should: abort and return a retryable timeout", async () => {
+    const doFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === AUTH_URL) return res(200);
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    }) as typeof fetch;
+    const handler = createCloudHandler({
+      fetch: doFetch,
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      deviceCallTimeoutMs: 5,
+      prepareDishUpdate: async () => new Uint8Array(),
+    });
+
+    await expect(
+      handler.updateDishConfig({ kind: "config", changes: { powerSaveMode: true } }),
+    ).resolves.toEqual({
+      status: 504,
+      body: {
+        error: "device_call_timeout",
+        message: "Starlink did not answer the dish update in time. Try again.",
+      },
+    });
+  });
+
+  it("given: invalid or empty renderer input, should: reject it before preparing a request", async () => {
+    let prepared = false;
+    const handler = createCloudHandler({
+      readCookie: () => SESSION,
+      prepareDishUpdate: async () => {
+        prepared = true;
+        return new Uint8Array();
+      },
+    });
+
+    await expect(handler.updateDishConfig({} as never)).resolves.toMatchObject({ status: 400 });
+    await expect(
+      handler.updateDishConfig({ kind: "config", changes: { swupdateRebootHour: 4 } }),
+    ).resolves.toMatchObject({ status: 400 });
+    await expect(
+      handler.updateDishConfig({ kind: "config", changes: { snowMeltMode: "MOSTLY" as never } }),
+    ).resolves.toMatchObject({ status: 400 });
+    await expect(
+      handler.updateDishConfig({ kind: "config", changes: { powerSaveDurationMinutes: -5 } }),
+    ).resolves.toMatchObject({ status: 400 });
+    expect(prepared).toBe(false);
+  });
+});

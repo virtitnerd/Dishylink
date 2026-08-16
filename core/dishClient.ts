@@ -675,13 +675,14 @@ export class DishClient {
    * As of mid-2026 firmware this -- like every local write RPC -- returns
    * PERMISSION_DENIED (grpc status 7); Starlink's official app writes through
    * their cloud, not the LAN. Kept wired up (not hidden) so it goes live the
-   * moment that changes, or once cloud-auth writes are added here.
+   * moment that changes, or once cloud-auth writes are added here. See
+   * core/dishConfigUpdate.ts for the cloud path this project actually uses.
    */
   async setConfig(changes: DishConfigJson, abortSignal?: AbortSignal): Promise<void> {
     await apiPost("/settings/dish-config", { changes }, abortSignal);
   }
 
-  /** Self-diagnostics: disablement code, hardware self-test, alerts. */
+  /** Dish self-diagnostics: disablement code, hardware self-test, alerts. */
   async getDiagnostics(abortSignal?: AbortSignal): Promise<DishDiagnosticsJson> {
     return apiGet(this.target === "dish" ? "/diagnostics" : "/router/diagnostics", abortSignal);
   }
