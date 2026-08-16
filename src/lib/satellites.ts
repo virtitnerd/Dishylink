@@ -196,7 +196,11 @@ export async function loadStarlinkTles(): Promise<TleRecord[]> {
     }
   }
 
-  const lines = tleText.split(/\r?\n/);
+  // CelesTrak's supplemental set (confirmed live, 2026-08-15) puts a blank
+  // line between every record line -- name, blank, line1, blank, line2,
+  // blank -- not the plain 3-line stride the classic TLE format uses.
+  // Dropping blanks first makes both layouts parse the same way.
+  const lines = tleText.split(/\r?\n/).filter((line) => line.trim().length > 0);
   const tleRecords: TleRecord[] = [];
   for (let lineIndex = 0; lineIndex + 2 < lines.length + 1; lineIndex += 3) {
     const name = lines[lineIndex]?.trim();
