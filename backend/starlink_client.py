@@ -136,6 +136,12 @@ class StarlinkClient:
         self._ensure_ready()
         return self._request_cls()
 
+    def new_response_message(self):
+        """An empty Response message, for decoding a cloud call's reply --
+        same schema-reuse reasoning as new_request_message()."""
+        self._ensure_ready()
+        return self._response_cls()
+
     # -- RPC plumbing ----------------------------------------------------------
 
     def _handle(self, request_field: str, request_type: str | None = None, **kwargs) -> Any:

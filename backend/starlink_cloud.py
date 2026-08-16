@@ -436,6 +436,32 @@ def _build_request_bytes(request_json: dict) -> bytes:
     return request.SerializeToString()
 
 
+class ApplicationRejectedError(Exception):
+    """Starlink accepted the RPC (200 OK / grpc-status 0) but the decoded
+    Response carries a non-zero status.code -- confirmed live (2026-08-15,
+    deleteNetwork): a bss sent with both its real bssid AND a password (even
+    the read-back masked "•••••" one) is rejected this way, inside the
+    response body, not as a transport-level error. Left unchecked, a request
+    built the wrong way looks like success and silently changes nothing."""
+
+
+def _redact_passwords(value: Any) -> Any:
+    """Deep-copy `value`, replacing every "password" string with a length +
+    masked-sentinel marker instead of the real value -- for logging only,
+    never for what's actually sent to Starlink."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k == "password" and isinstance(v, str):
+                out[k] = f"<{len(v)} chars, masked-sentinel={v == '•••••'}>"
+            else:
+                out[k] = _redact_passwords(v)
+        return out
+    if isinstance(value, list):
+        return [_redact_passwords(v) for v in value]
+    return value
+
+
 def _apply_device_update(prepare_fn: Callable[[dict], dict], update: dict, label: str) -> tuple[int, dict]:
     if not read_cookie():
         return NOT_CONNECTED
@@ -449,11 +475,19 @@ def _apply_device_update(prepare_fn: Callable[[dict], dict], update: dict, label
 
             def run(cookie: str) -> None:
                 try:
-                    _grpc_web_unary_call(DEVICE_HANDLE, request_bytes, cookie)
+                    response_bytes = _grpc_web_unary_call(DEVICE_HANDLE, request_bytes, cookie)
                 except GrpcWebCallError as exc:
                     if exc.status == 16:
                         raise SessionExpiredError()
                     raise
+                # The RPC succeeding at the transport level doesn't mean
+                # Starlink actually applied the change -- see
+                # ApplicationRejectedError's own note.
+                response = get_client().new_response_message()
+                response.ParseFromString(response_bytes)
+                status = json_format.MessageToDict(response, preserving_proto_field_name=False).get("status")
+                if status and status.get("code"):
+                    raise ApplicationRejectedError(status.get("message") or f"status code {status['code']}")
 
             _with_fresh_cookie(run)
         return 200, {"ok": True}
@@ -464,6 +498,8 @@ def _apply_device_update(prepare_fn: Callable[[dict], dict], update: dict, label
             "error": "device_call_timeout",
             "message": f"Starlink did not answer the {label} update in time. Try again.",
         }
+    except ApplicationRejectedError as exc:
+        return 502, {"error": "device_update_rejected", "message": str(exc)}
     except Exception as exc:  # noqa: BLE001 -- API boundary
         return 502, {"error": "device_call_failed", "message": str(exc)}
 
@@ -628,6 +664,40 @@ def _auth_fields_for(security: str | None, password: str) -> dict:
     return {"authWpa2": {"password": password}}
 
 
+_AUTH_FIELDS = ("authWpa2", "authWpa3", "authWpa2Wpa3", "authOpen")
+
+
+def _strip_bssid(bss: dict) -> dict:
+    """bssid dropped -- confirmed live (2026-08-15) that Starlink's write
+    validation rejects it outright ("Bssid must not be specified"): it's a
+    read-only, router-assigned field, never something a write may echo back.
+    A band left alone keeps its auth field exactly as read -- the masked
+    "•••••" password IS the correct "leave this alone" signal (a bss must
+    always carry *some* auth type: omitting it entirely is its own rejection,
+    "Bss has unknown auth type: <nil>"). The rejection in both cases comes
+    back inside the response body (status.code != 0), not as a
+    transport-level error, so a request built the wrong way returns 200 OK
+    and silently changes nothing -- see _apply_device_update's
+    response-status check below, added for the same incident."""
+    return {k: v for k, v in bss.items() if k != "bssid"}
+
+
+def _strip_for_new_auth(bss: dict) -> dict:
+    """bssid and every existing auth_* field dropped, for a band whose
+    security is being freshly set -- the same reason a brand new band never
+    carries a bssid either: the router mints its own."""
+    return {k: v for k, v in bss.items() if k != "bssid" and k not in _AUTH_FIELDS}
+
+
+def _passthrough_network(network: dict) -> dict:
+    """A network passed through unmodified -- only bssid dropped from each
+    band (see _strip_bssid); auth is left exactly as read."""
+    return {
+        **network,
+        "basicServiceSets": [_strip_bssid(bss) for bss in network.get("basicServiceSets") or []],
+    }
+
+
 def _prepare_wifi_config_update(update: dict) -> dict:
     client = get_client()
     status = client.get_router_status()
@@ -652,7 +722,7 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         level = update["level"]
         new_networks = []
         for n in networks:
-            nn = {**n, "sandboxEnabled": level != 0, "sandboxId": level}
+            nn = {**_passthrough_network(n), "sandboxEnabled": level != 0, "sandboxId": level}
             if update.get("allowDomains") is not None:
                 nn["sandboxDomainAllowList"] = update["allowDomains"]
             new_networks.append(nn)
@@ -668,15 +738,15 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         new_networks = []
         for network in config.get("networks") or []:
             if network.get("domain") != update["networkDomain"]:
-                new_networks.append(network)
+                new_networks.append(_passthrough_network(network))
                 continue
             new_bss = []
             for bss in network.get("basicServiceSets") or []:
                 if bss.get("band") != update["band"]:
-                    new_bss.append(bss)
+                    new_bss.append(_strip_bssid(bss))
                     continue
                 matched = True
-                bare = {k: v for k, v in bss.items() if k not in ("authWpa2", "authWpa3", "authWpa2Wpa3", "authOpen")}
+                bare = _strip_for_new_auth(bss)
                 bare["ssid"] = update["ssid"]
                 bare.update(_auth_fields_for(update.get("security"), update["password"]))
                 if update.get("hidden") is not None:
@@ -695,10 +765,10 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         new_networks = []
         for network in config.get("networks") or []:
             if network.get("domain") != update["networkDomain"]:
-                new_networks.append(network)
+                new_networks.append(_passthrough_network(network))
                 continue
             matched = True
-            nn = dict(network)
+            nn = _passthrough_network(network)
             if update.get("mode") is not None:
                 nn.update(NETWORK_MODE_FIELDS[update["mode"]])
             for field in (
@@ -734,14 +804,16 @@ def _prepare_wifi_config_update(update: dict) -> dict:
                 {"band": "RF_5GHZ", "ssid": update["ssid"], "authWpa2": {"password": update["password"]}, "hidden": hidden},
             ],
         }
-        return _wifi_config_request_for(target_id, {"networks": [*existing, new_network]})
+        return _wifi_config_request_for(
+            target_id, {"networks": [*(_passthrough_network(n) for n in existing), new_network]}
+        )
 
     if kind == "deleteNetwork":
         config = client.get_wifi_config().get("wifiConfig", {})
         existing = config.get("networks") or []
         if existing and existing[0].get("domain") == update["networkDomain"]:
             raise ValueError("the first network can't be deleted, only modified")
-        new_networks = [n for n in existing if n.get("domain") != update["networkDomain"]]
+        new_networks = [_passthrough_network(n) for n in existing if n.get("domain") != update["networkDomain"]]
         if len(new_networks) == len(existing):
             raise ValueError(f"no network \"{update['networkDomain']}\" found")
         return _wifi_config_request_for(target_id, {"networks": new_networks})

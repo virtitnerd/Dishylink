@@ -3,6 +3,7 @@ import type {
   HtBandwidth,
   TxPowerLevel,
   VhtBandwidth,
+  WifiBasicServiceSetJson,
   WifiLanNetworkJson,
   WifiSecurityType,
   WirelessMode,
@@ -216,6 +217,43 @@ function authFieldsFor(security: WifiSecurityType | undefined, password: string)
   return { authWpa2: { password } };
 }
 
+const AUTH_FIELDS = ["authWpa2", "authWpa3", "authWpa2Wpa3", "authOpen"] as const;
+
+/** bssid dropped -- confirmed live (2026-08-15) that Starlink's write
+ *  validation rejects it outright ("Bssid must not be specified"): it's a
+ *  read-only, router-assigned field, never something a write may echo back.
+ *  A band left alone keeps its auth field exactly as read -- the masked
+ *  "•••••" password IS the correct "leave this alone" signal (a bss must
+ *  always carry *some* auth type: omitting it entirely is its own rejection,
+ *  "Bss has unknown auth type: <nil>"). Both rejections came back inside the
+ *  response body (a non-zero status.code), not as a transport-level error,
+ *  so a request built the wrong way returned 200 OK and silently changed
+ *  nothing -- this project's own account of the incident is worth reading
+ *  before touching this function again. */
+function stripBssid(bss: WifiBasicServiceSetJson): WifiBasicServiceSetJson {
+  const { bssid: _bssid, ...rest } = bss;
+  return rest;
+}
+
+/** bssid and every existing auth_* field dropped, for a band whose security
+ *  is being freshly set -- the same reason a brand new band never carries a
+ *  bssid either: the router mints its own. */
+function stripForNewAuth(bss: WifiBasicServiceSetJson): WifiBasicServiceSetJson {
+  const bare: Record<string, unknown> = { ...bss };
+  delete bare.bssid;
+  for (const field of AUTH_FIELDS) delete bare[field];
+  return bare;
+}
+
+/** A network passed through unmodified -- only bssid dropped from each band
+ *  (see stripBssid); auth is left exactly as read. */
+function passthroughNetwork(network: WifiLanNetworkJson): WifiLanNetworkJson {
+  return {
+    ...network,
+    basicServiceSets: (network.basicServiceSets ?? []).map(stripBssid),
+  };
+}
+
 /** Trusted-host preparation, mirroring prepareRouterClientUpdate: source the
  *  target device id directly from the local router immediately before
  *  encoding the cloud write. Every kind past "dns"/"bypassMode" needs the
@@ -246,7 +284,7 @@ export async function prepareRouterWifiConfigUpdate(
   if (update.kind === "contentFiltering") {
     const config = await router.getWifiConfig(AbortSignal.timeout(5_000));
     const networks = (config.networks ?? []).map((network) => ({
-      ...network,
+      ...passthroughNetwork(network),
       sandboxEnabled: update.level !== 0,
       sandboxId: update.level,
       ...(update.allowDomains !== undefined ? { sandboxDomainAllowList: update.allowDomains } : {}),
@@ -272,18 +310,14 @@ export async function prepareRouterWifiConfigUpdate(
     const config = await router.getWifiConfig(AbortSignal.timeout(5_000));
     let matched = false;
     const networks = (config.networks ?? []).map((network) => {
-      if (network.domain !== update.networkDomain) return network;
+      if (network.domain !== update.networkDomain) return passthroughNetwork(network);
       return {
         ...network,
         basicServiceSets: (network.basicServiceSets ?? []).map((bss) => {
-          if (bss.band !== update.band) return bss;
+          if (bss.band !== update.band) return stripBssid(bss);
           matched = true;
-          // The auth_* fields are a oneof -- strip every variant the read
-          // brought back before setting exactly the one this write wants, or
-          // a stale authWpa2 would ride along next to a fresh authWpa3.
-          const { authWpa2: _wpa2, authWpa3: _wpa3, authWpa2Wpa3: _mixed, authOpen: _open, ...bare } = bss;
           return {
-            ...bare,
+            ...stripForNewAuth(bss),
             ssid: update.ssid,
             ...authFieldsFor(update.security, update.password),
             ...(update.hidden !== undefined ? { hidden: update.hidden } : {}),
@@ -301,10 +335,10 @@ export async function prepareRouterWifiConfigUpdate(
     const config = await router.getWifiConfig(AbortSignal.timeout(5_000));
     let matched = false;
     const networks = (config.networks ?? []).map((network) => {
-      if (network.domain !== update.networkDomain) return network;
+      if (network.domain !== update.networkDomain) return passthroughNetwork(network);
       matched = true;
       return {
-        ...network,
+        ...passthroughNetwork(network),
         ...(update.mode !== undefined ? NETWORK_MODE_FIELDS[update.mode] : {}),
         ...(update.ipv4 !== undefined ? { ipv4: update.ipv4 } : {}),
         ...(update.dhcpv4Start !== undefined ? { dhcpv4Start: update.dhcpv4Start } : {}),
@@ -336,18 +370,17 @@ export async function prepareRouterWifiConfigUpdate(
       dhcpv4End: 254,
       dhcpv4LeaseDurationS: 3600,
       ...NETWORK_MODE_FIELDS[update.mode],
-      // bssid is deliberately omitted -- every bssid on this router shares
-      // the locally-administered-MAC bit pattern the IEEE reserves for
-      // software-generated addresses, which points at the router assigning
-      // them itself rather than expecting a caller to invent one (and
-      // inventing a colliding or malformed one is a worse failure mode than
-      // leaving the field for the router to fill in).
+      // bssid deliberately omitted -- confirmed live (2026-08-15) that
+      // Starlink's write validation rejects a bssid on any band regardless
+      // of whether it's new or existing; the router always mints its own.
       basicServiceSets: [
         { band: "RF_2GHZ", ssid: update.ssid, authWpa2: { password: update.password }, hidden: update.hidden ?? false },
         { band: "RF_5GHZ", ssid: update.ssid, authWpa2: { password: update.password }, hidden: update.hidden ?? false },
       ],
     };
-    return router.encodeRequest(wifiConfigRequestFor(targetId, { networks: [...existing, newNetwork] }));
+    return router.encodeRequest(
+      wifiConfigRequestFor(targetId, { networks: [...existing.map(passthroughNetwork), newNetwork] }),
+    );
   }
 
   if (update.kind === "deleteNetwork") {
@@ -355,7 +388,9 @@ export async function prepareRouterWifiConfigUpdate(
     const existing = config.networks ?? [];
     if (existing[0]?.domain === update.networkDomain)
       throw new Error("the first network can't be deleted, only modified");
-    const networks = existing.filter((network) => network.domain !== update.networkDomain);
+    const networks = existing
+      .filter((network) => network.domain !== update.networkDomain)
+      .map(passthroughNetwork);
     if (networks.length === existing.length)
       throw new Error(`no network "${update.networkDomain}" found`);
     return router.encodeRequest(wifiConfigRequestFor(targetId, { networks }));
