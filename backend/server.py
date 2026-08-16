@@ -937,6 +937,43 @@ def api_satellites_tle():
     return JSONResponse({"ok": True, "data": text, "fetchedAt": fetched_at})
 
 
+# The frontend actually calls this generic proxy (see satellites.ts's own
+# tleBaseUrl), not /api/satellites/tle above -- that one predates this and is
+# unused, kept only for API-coverage completeness. Vite's dev server has its
+# own /celestrak rewrite rule (vite.config.ts); this is the same thing for
+# when server.py is the only thing running (packaged/Docker), so satellite
+# positions don't silently 404 outside a dev-proxied setup.
+CELESTRAK_CACHE_DIR = Path(os.environ.get("STARLINK_CACHE_DIR", "cache")) / "celestrak"
+
+
+@app.get("/celestrak/{path:path}")
+def celestrak_proxy(path: str, request: Request):
+    query = request.url.query
+    cache_key = f"{path}?{query}" if query else path
+    cache_path = CELESTRAK_CACHE_DIR / (urllib.parse.quote(cache_key, safe="") + ".txt")
+    now = time.time()
+    try:
+        cached = cache_path.read_text(encoding="utf-8")
+        if now - cache_path.stat().st_mtime <= TLE_CACHE_TTL_S:
+            return Response(cached, media_type="text/plain")
+    except FileNotFoundError:
+        cached = None
+
+    url = f"https://celestrak.org/{path}" + (f"?{query}" if query else "")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "starlink-dashboard/1.0 (local monitoring tool)"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            text = resp.read().decode("utf-8")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(text, encoding="utf-8")
+        return Response(text, media_type="text/plain")
+    except urllib.error.URLError as exc:
+        if cached is not None:
+            # Stale cache beats no data -- Celestrak rate-limits aggressively.
+            return Response(cached, media_type="text/plain")
+        return JSONResponse({"ok": False, "error": f"couldn't reach Celestrak: {exc}"}, status_code=502)
+
+
 # "static" for the original vanilla-JS build (this file's own directory);
 # "../dist" for the dishylink fork, where this file lives in backend/ next to
 # the Vite build output. Auto-detected so one server.py works unmodified in
