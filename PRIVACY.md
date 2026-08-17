@@ -9,8 +9,16 @@ Dishylink talks directly to your dish and router over your own LAN, including
 while its window is closed. Everything it measures — throughput, latency,
 power draw, obstruction, outages, thermal events, radio temps, device lists —
 is written to local storage on your machine and is never transmitted
-anywhere. There is no backend, no analytics, and no telemetry collection by
-us. We do not see your data; we never receive it.
+anywhere. There is no analytics and no telemetry collection by us. We do not
+see your data; we never receive it.
+
+Dishylink also offers an optional standalone server component (`backend/`,
+or its Docker image) for running it headless on your own machine or home
+server instead of as a desktop app or extension. This is still entirely
+yours: it runs on hardware you control, talks only to your own dish, router,
+and — if you connect one — your own Starlink account, and stores everything
+locally exactly like the desktop app and extension do. It is not a service we
+operate, and nothing it records or handles reaches us.
 
 ## The optional "connect account" feature
 
@@ -37,11 +45,14 @@ session is created or stored.
 
 ## Third parties
 
-The one exception to "never leaves your machine": the in-app speed test
-measures your connection against Cloudflare's public speed-test
-infrastructure, the same way any browser-based speed test does. That request
-carries no personal data beyond what any internet connection to Cloudflare
-already involves.
+Two exceptions to "never leaves your machine," neither carrying any personal
+data:
+
+- The in-app speed test measures your connection against Cloudflare's public
+  speed-test infrastructure, the same way any browser-based speed test does.
+- The sky view fetches public satellite orbital data (TLEs) for the Starlink
+  constellation from CelesTrak, an established public source for this kind of
+  data, to plot which satellites are overhead.
 
 ## Open source
 

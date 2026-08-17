@@ -83,9 +83,9 @@ below as requiring an optional Starlink account connection:
 Custom DNS, bypass mode, and content filtering are deliberately _not_ exposed: a
 bad write there can take the WiFi down until a physical reset.
 
-## Three ways to run it
+## Four ways to run it
 
-Dishylink ships as three independent products from one codebase — pick
+Dishylink ships as four independent products from one codebase — pick
 whichever fits:
 
 ```bash
@@ -94,10 +94,18 @@ npm install
 npm run dev             # web dev harness — requires being on the Starlink LAN
 npm run dev:electron    # desktop app (Mac/Windows), packaged via electron-builder
 npm run dev:extension   # browser extension (Chrome, Edge, Firefox, via WXT)
+cd backend && ./start.sh # standalone server / Docker — headless, single port
 ```
 
-They don't talk to each other or share a runtime — each independently polls
-the dish/router and records its own history. Packaging:
+The desktop app, the extension, and the standalone server each poll the
+dish/router directly and record their own history independently — none of
+them talk to each other. The web dev harness is the one exception: it proxies
+`/api/*` to the standalone server (`backend/server.py`, default port `8787`)
+rather than reimplementing a second copy of that logic for local development,
+so `backend/server.py` needs to already be running for `npm run dev` to show
+real data. See [backend/README.md](backend/README.md) for what the standalone
+server is and why it's a separate implementation from the other three, not a
+shared library underneath them. Packaging:
 
 ```bash
 npm run pack:mac        # signed Mac build
@@ -105,6 +113,7 @@ npm run pack:win        # Windows build
 npm run build:extension # Chromium extension bundle
 npm run build:extension:firefox
 npm run build:extension:edge
+docker build -t dishylink .   # standalone server, single port, see Dockerfile
 ```
 
 ### Desktop app (Mac, Windows)
@@ -136,6 +145,23 @@ or [Firefox Add-ons](https://addons.mozilla.org/addon/dishylink/).
   coverage gaps for stretches when the browser was closed.
 - Chrome 144+ — below that a Local Network Access bug makes the worker silently
   collect nothing.
+
+### Server (Docker, headless)
+
+A Python/FastAPI backend (`backend/`) that polls the dish and router itself,
+records its own local history, and serves `/api/*`, `/cloud/*`,
+`/celestrak/*`, and the built frontend from one process on one port —
+`8787` by default. Meant for a NAS, homelab box, or anywhere you want
+Dishylink running without a desktop app or browser open, and for the eventual
+option of pointing the desktop app or extension at a shared instance instead
+of each polling the hardware on its own. See
+[backend/README.md](backend/README.md) for configuration and the full route
+list.
+
+```bash
+docker build -t dishylink .
+docker run -p 8787:8787 dishylink
+```
 
 Dev workflow:
 
@@ -187,14 +213,22 @@ timestamps in the **GPS epoch** while `eventLog` uses Unix — the converter
 accounts for the 18 leap seconds. See `LOCAL-API.md` for the full set of
 measured behaviours, quirks, and dead-end fields on this firmware.
 
+The standalone server (`backend/starlink_client.py`) talks to the same two
+APIs independently rather than sharing this code — being a real process and
+not a browser, it calls the dish's native gRPC port (9200) directly instead
+of going through the grpc-web port, and pulls its own copy of the schema from
+the dish's reflection service at startup instead of the vendored protoset.
+
 ## Recorded history
 
 The dish and router only hold a few minutes to a few hours locally. An
-always-on **history recorder** (`collector/`, the "historian") polls
-continuously and writes append-only local records so day/week/month views
-have real data behind them — never anything invented across a gap; every
-range reports what fraction of it was actually sampled. See
-`collector/README.md` for how it runs and its on-disk format.
+always-on **history recorder** (the "historian") polls continuously and writes
+append-only local records so day/week/month views have real data behind
+them — never anything invented across a gap; every range reports what
+fraction of it was actually sampled. Desktop and the extension use
+`collector/historian.mts` (see `collector/README.md`); the standalone server
+uses its own `backend/historian.py`, writing the same style of append-only
+local records independently rather than depending on the Node service.
 
 Everything above is local-only by design: your telemetry, your history, your
 storage, never transmitted.

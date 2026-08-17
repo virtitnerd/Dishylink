@@ -30,7 +30,10 @@ load. Two rules follow from that:
 - **Don't add a new poll against the dish or router.** Reuse a reply that is
   already being fetched — `routerStatusFeed` in the browser, or the existing
   status poll in the recorder. If you genuinely need a new one, raise an issue
-  first so it can be discussed before anyone's link goes down.
+  first so it can be discussed before anyone's link goes down. This applies
+  equally to `backend/starlink_client.py`, which polls the hardware
+  independently of the TS code above — it is not exempt just because it's a
+  separate implementation.
 
 Custom DNS, bypass mode and content filtering are deliberately not exposed: a
 bad write there can take the WiFi down until a physical reset.
@@ -43,11 +46,16 @@ npm install
 npm run dev             # web dev harness — requires being on the Starlink LAN
 npm run dev:electron    # desktop app (macOS, Windows)
 npm run dev:extension   # browser extension (Chrome, Edge, Firefox)
+cd backend && ./start.sh # standalone server (Python/FastAPI), see backend/README.md
 ```
 
-The three products are independent: they don't share a runtime, and each polls
-and records on its own. A change to shared code under `src/` affects all three,
-so check the one you didn't intend to touch.
+The desktop app, the extension, and the standalone server are independent:
+they don't share a runtime, and each polls and records on its own. (The web
+dev harness is the exception — it proxies `/api/*` to the standalone server
+rather than duplicating that logic, so `backend/server.py` needs to be running
+for `npm run dev` to show real data.) A change to shared code under `src/`
+affects the desktop app, extension, and dev harness; a change under `backend/`
+needs a server restart to take effect and doesn't touch the other three at all.
 
 ## Checks
 

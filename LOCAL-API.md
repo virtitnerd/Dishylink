@@ -129,6 +129,35 @@ client, and serializes mutations so concurrent writes cannot overwrite one
 another. The encoded request is built by the trusted host; renderer-provided
 protobuf is never accepted.
 
+### WifiConfig writes: bssid and auth are mutually exclusive
+
+Measured 2026-08-15, deleting a network via the cloud write path. Every
+`basicServiceSets[]` entry in a `WifiConfig.networks[]` write must carry
+**either** a `bssid` **or** an auth field (`authWpa2`/`authWpa3`/
+`authWpa2Wpa3`/`authOpen`) — **never both, never neither**. Two live error
+messages, both returned inside a 200 OK response body rather than as a
+transport-level error:
+
+- Sending both together: `"Incorrect bss specification, must have a bssid:(...)
+XOR password:(•••••)."`
+- Sending bssid alone, auth stripped: `"Bssid must not be specified."` +
+  `"Bss has unknown auth type: <nil>."`
+
+The correct rule: `bssid` is read-only/router-assigned and must never be sent
+on any write. Every band must always carry some auth field, including the
+masked `"•••••"` password on a band left untouched — that masked value **is**
+the correct "leave this alone" signal, it just can't be paired with a bssid. A
+band being freshly given a new password must drop both its old auth field and
+its bssid.
+
+This is why a write can appear to succeed (HTTP 200, no thrown error) while
+the router is completely untouched: Starlink's cloud gateway embeds real
+validation errors inside `Device.Response.status`, a field neither the
+original TS implementation nor the Python port checked before this was found.
+Both now decode the response and raise on a non-zero `status.code` —
+`ApplicationRejectedError` in `backend/starlink_cloud.py`, the equivalent
+check in `cloud/starlinkCloudHandler.ts`.
+
 The write requires a current Starlink account session and is available only for
 a device present in the router's live client list. Dishylink does not expose the
 control for the device it is running on, avoiding a self-inflicted disconnect.
