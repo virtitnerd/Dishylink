@@ -6,12 +6,15 @@
 // direction, which is the fallback here — a router answering locally is not
 // bypassed, whatever the account's telemetry does or does not carry.
 //
-// The account is also what makes the way back reachable. The write rides the
-// cloud gateway, which needs some internet rather than Starlink's in particular,
-// so a kit with a third-party router wired in can be un-bypassed from the very
-// machine that bypassed it. With nothing else serving internet that takes another
-// device on mobile data, which is why an unreachable account says so plainly
-// instead of only greying the control out.
+// Starlink's own support documentation names a factory reset via the router's
+// physical reset button as the way out of bypass mode -- no account- or app-side
+// undo is documented anywhere. The write below still rides the cloud gateway for
+// the "off" direction, because a LAN write has no chance at all once bypassed
+// (the router answers nothing locally by definition), so this is strictly the
+// only path with any chance of working -- but it is unverified, not a documented
+// or guaranteed recovery. If the account never confirms the change, treat that
+// as the answer and use the physical button instead of waiting further; see
+// SETTLE_TIMEOUT_MS below.
 
 import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
@@ -30,7 +33,7 @@ import { SpinLoader } from "../loaders/SpinLoader";
 import { SettingRow } from "./settingsChrome";
 
 const BYPASS_TIP =
-  "Advanced feature that disables the Starlink router completely, so the dish serves a third-party router instead. The Starlink WiFi goes off and the client list, custom DNS and subnet stop working. Most users should leave this off.";
+  "Advanced feature that disables the Starlink router completely, so the dish serves a third-party router instead. The Starlink WiFi goes off and the client list, custom DNS and subnet stop working. Starlink's documented way to turn it back off is a factory reset via the router's physical reset button -- most users should leave this off.";
 
 /** How long the account is given to report a write before the row stops waiting
  *  on it. Measured against hardware, the flip showed up around two minutes. */
@@ -186,8 +189,8 @@ export function BypassSection({
           // weight instead, which is what it is separately severable for.
           <Callout tone='info' icon='warning' iconSeverity={target ? "danger" : "normal"}>
             {target
-              ? "Bypass mode will completely disable the Starlink router and its WiFi. Only a third-party router wired to the dish stay online. You can turn it back off from here as long as this device is has access to the internet."
-              : "Bypass is on, so the Starlink router is disabled and a third-party router runs your network. Turning bypass off brings the Starlink router and its WiFi back."}
+              ? "Bypass mode will completely disable the Starlink router and its WiFi. Only a third-party router wired to the dish stays online. Starlink's documented way back is a factory reset via the router's physical reset button -- this panel can attempt to reverse it through your account, but that isn't a documented or guaranteed recovery path."
+              : "Bypass is on, so the Starlink router is disabled and a third-party router runs your network. This will attempt to bring the Starlink router and its WiFi back through your account. If it doesn't take within a few minutes, use the router's physical reset button instead -- that's Starlink's documented way out."}
           </Callout>
         )}
       </div>
@@ -204,8 +207,8 @@ export function BypassSection({
             </DialogTitle>
             <DialogDescription className='text-[13.5px] leading-relaxed'>
               {offered
-                ? "The Starlink router and its WiFi will switch off. Only devices behind a third-party router wired to the dish stay online. You can turn bypass back off from here as long as this device still has internet — if nothing else provides it, you will need another device on mobile data."
-                : "The Starlink router and its WiFi come back on. Devices connected through a third-party router may need to reconnect."}
+                ? "The Starlink router and its WiFi will switch off. Only devices behind a third-party router wired to the dish stay online. Starlink's documented way back is a factory reset via the router's physical reset button -- this app can attempt to reverse it through your account afterward, but that isn't a documented or guaranteed recovery path."
+                : "This attempts to bring the Starlink router and its WiFi back through your account. If it doesn't take within a few minutes, use the router's physical reset button instead -- that's Starlink's documented way out of bypass mode."}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className='mt-2 gap-2'>
