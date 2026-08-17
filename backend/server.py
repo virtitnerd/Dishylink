@@ -985,4 +985,10 @@ app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static")
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8787)
+    # Defaults keep a bare `python server.py` local-only; the Docker image sets
+    # STARLINK_HOST=0.0.0.0 so the container's port mapping can actually reach it.
+    uvicorn.run(
+        app,
+        host=os.environ.get("STARLINK_HOST", "127.0.0.1"),
+        port=int(os.environ.get("STARLINK_PORT", "8787")),
+    )

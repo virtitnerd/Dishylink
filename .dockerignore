@@ -1,0 +1,34 @@
+# Mirrors .gitignore -- kept separate because Docker's COPY . . (frontend
+# stage) and COPY backend/ . (runtime stage) would otherwise bake node_modules,
+# local build output, and backend runtime state (including a live starlink.com
+# session cookie, if one has been used locally) into image layers.
+
+node_modules
+dist
+dist-electron
+release
+.output
+.wxt
+.DS_Store
+.git
+
+collector/data
+
+**/__screenshots__/
+.vitest-attachments/
+
+.starlink-cookie
+
+backend/__pycache__/
+backend/*.pyc
+backend/server.log
+backend/server.pid
+backend/history/
+backend/cache/
+
+.claude/
+*.local.md
+
+landing/
+.wrangler/
+.astro/

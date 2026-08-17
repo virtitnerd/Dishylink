@@ -9,6 +9,7 @@ firmware updates.
 """
 from __future__ import annotations
 
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -18,7 +19,10 @@ import grpc
 from google.protobuf import descriptor_pb2, descriptor_pool, json_format, message_factory
 from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
 
-DISH_HOST = "192.168.100.1"
+# Overridable so a Docker deployment not sitting on the dish's own subnet (e.g.
+# a router upstream of the container doing the NAT) can still be pointed at it;
+# every real installation on the Starlink LAN itself uses the defaults.
+DISH_HOST = os.environ.get("STARLINK_DISH_HOST", "192.168.100.1")
 DISH_PORT = 9200
 DEVICE_SERVICE_SYMBOL = "SpaceX.API.Device.Device"
 
@@ -29,7 +33,7 @@ DEVICE_SERVICE_SYMBOL = "SpaceX.API.Device.Device"
 # own port 9200 because the dish process genuinely doesn't serve them -- the
 # router process does. Reuses the dish's schema (proven identical) instead of
 # fetching it again, since gRPC reflection isn't available on this port.
-ROUTER_HOST = "192.168.1.1"
+ROUTER_HOST = os.environ.get("STARLINK_ROUTER_HOST", "192.168.1.1")
 ROUTER_PORT = 9001
 ROUTER_HANDLE_URL = f"http://{ROUTER_HOST}:{ROUTER_PORT}/{DEVICE_SERVICE_SYMBOL}/Handle"
 
