@@ -237,11 +237,16 @@ function controllerBypassed(account: CloudAccount | null): boolean | null {
 export function RouterSettingsTab({
   wifiConfig,
   routerReachable,
+  viaAccount,
   unreachable,
   onConfigChanged,
 }: {
   wifiConfig: WifiNetworkConfigJson | null;
   routerReachable: boolean | null;
+  /** Whether `wifiConfig` was read through the account because the LAN could not
+   *  serve it. What it says is the same either way; what still cannot be done
+   *  from here is anything that dials the router directly. */
+  viaAccount: boolean;
   /** Why the router is silent, when it is. Null while it is answering. */
   unreachable: RouterUnreachable | null;
   /** For a write that leaves the router up, which nothing else would re-read.
@@ -274,7 +279,11 @@ export function RouterSettingsTab({
   // that's the whole point of it riding the account instead (see BypassSection's
   // own header comment).
   const answering = routerReachable !== null && !unreachable && wifiConfig !== null;
-  const showDns = answering && !wifiConfig?.customDnsDisabled;
+  // What the config says is worth showing however it arrived -- and the writes
+  // beside it go through the account, not the LAN, so they were never waiting on
+  // the router to answer here in the first place.
+  const configKnown = wifiConfig !== null && (answering || viaAccount);
+  const showDns = configKnown && !wifiConfig?.customDnsDisabled;
   // Read from the account rather than the router: a bypassed router answers
   // nothing on the LAN, so `wifiConfig` is silent exactly when the answer is yes.
   const bypassed = controllerBypassed(cloudAccount.data);
@@ -462,8 +471,16 @@ export function RouterSettingsTab({
       {/* Branch on the diagnosis rather than on `routerReachable` again: it is
           derived from that same flag, so this cannot render an empty callout. */}
       {unreachable && <Callout tone='error'>{unreachable.message}</Callout>}
+      {/* Populated sections under that error would otherwise read as if the
+          router were answering after all. */}
+      {viaAccount && (
+        <Callout tone='info' className='mt-2.5'>
+          What follows is read through your Starlink account. Anything that dials the router
+          directly — a reboot — stays unavailable until it answers here.
+        </Callout>
+      )}
 
-      {answering && wifiConfig && (
+      {configKnown && (
         <>
           <SectionLabel>Networks</SectionLabel>
           {networks.map((network, index) => {

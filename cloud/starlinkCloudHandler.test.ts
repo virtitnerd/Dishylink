@@ -135,24 +135,23 @@ describe("createCloudHandler pauseClient", () => {
     const responseMessage = new Uint8Array([10, 0]);
     const responseFrame = new Uint8Array([0, 0, 0, 0, responseMessage.length, ...responseMessage]);
     const captured: { url: string; init?: RequestInit } = { url: "" };
-    const doFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url === AUTH_URL) return res(200);
-      captured.url = url;
-      captured.init = init;
-      return {
-        status: 200,
-        ok: true,
-        headers: { get: () => null },
-        arrayBuffer: async () => responseFrame.buffer,
-      } as unknown as Response;
-    }) as typeof fetch;
     const handler = createCloudHandler({
-      fetch: doFetch,
+      fetch: gateway(async (init, url) => {
+        captured.url = url ?? "";
+        captured.init = init;
+        return {
+          status: 200,
+          ok: true,
+          headers: { get: () => null },
+          arrayBuffer: async () => responseFrame.buffer,
+        } as unknown as Response;
+      }),
       readCookie: () => SESSION,
       retryDelayMs: 0,
-      prepareDeviceUpdate: async (update) => {
+      prepareDeviceUpdate: async (update, targetId) => {
         expect(update).toEqual({ kind: "pause", clientId: 7, paused: true });
+        // Named by the account, not by anything read off the local network.
+        expect(targetId).toBe(TARGET);
         return request;
       },
     });
@@ -176,20 +175,19 @@ describe("createCloudHandler pauseClient", () => {
     let authCalls = 0;
     let deviceCalls = 0;
     const responseFrame = new Uint8Array([0, 0, 0, 0, 0]);
-    const doFetch = (async (input: RequestInfo | URL) => {
-      if (String(input) === AUTH_URL) {
-        authCalls++;
-        return res(200);
-      }
-      deviceCalls++;
-      if (deviceCalls === 1) return res(401);
-      return {
-        status: 200,
-        ok: true,
-        headers: { get: () => null },
-        arrayBuffer: async () => responseFrame.buffer,
-      } as unknown as Response;
-    }) as typeof fetch;
+    const doFetch = gateway(
+      async () => {
+        deviceCalls++;
+        if (deviceCalls === 1) return res(401);
+        return {
+          status: 200,
+          ok: true,
+          headers: { get: () => null },
+          arrayBuffer: async () => responseFrame.buffer,
+        } as unknown as Response;
+      },
+      () => authCalls++,
+    );
     const handler = createCloudHandler({
       fetch: doFetch,
       readCookie: () => SESSION,
@@ -273,8 +271,7 @@ describe("createCloudHandler pauseClient", () => {
     const responseFrame = new Uint8Array([0, 0, 0, 0, 0]);
     let releaseFirstWrite: (() => void) | undefined;
     let deviceCalls = 0;
-    const doFetch = (async (input: RequestInfo | URL) => {
-      if (String(input) === AUTH_URL) return res(200);
+    const doFetch = gateway(async () => {
       deviceCalls++;
       if (deviceCalls === 1) {
         await new Promise<void>((resolve) => {
@@ -287,7 +284,7 @@ describe("createCloudHandler pauseClient", () => {
         headers: { get: () => null },
         arrayBuffer: async () => responseFrame.buffer,
       } as unknown as Response;
-    }) as typeof fetch;
+    });
     const prepared: number[] = [];
     const handler = createCloudHandler({
       fetch: doFetch,
@@ -445,30 +442,40 @@ describe("createCloudHandler updateDishConfig", () => {
   });
 });
 
-describe("updateRouterConfig", () => {
-  const TARGET = "Router-010000000000000001B31340";
-  const SUBNET = { kind: "subnet" as const, subnet: "192.168.2.1/24", password: "hunter2hunter2" };
+const TARGET = "Router-010000000000000001B31340";
 
-  /** Answers everything the controller lookup needs, then defers the device
-   *  gateway to `onDevice`. */
-  function gateway(onDevice: (init?: RequestInit) => Promise<Response>) {
-    return (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url === AUTH_URL) return res(200);
-      if (url.includes("service-lines"))
-        return res(200, {
-          content: { results: [{ serviceLineNumber: "SL-1", accountReferenceId: "ACC-1" }] },
-        });
-      if (url.includes("/device-data/cache/v1/telemetry"))
-        return res(200, {
-          data: {
-            columnNamesByDeviceType: { r: ["DeviceId", "WifiHopsFromController"] },
-            values: [["r", TARGET, 0]],
-          },
-        });
-      return onDevice(init);
-    }) as typeof fetch;
-  }
+/** Answers everything the controller lookup needs, then defers the device
+ *  gateway to `onDevice`. `onAuth` counts token refreshes for the tests that
+ *  care how many there were. */
+function gateway(
+  onDevice: (init?: RequestInit, url?: string) => Promise<Response>,
+  onAuth?: () => void,
+) {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === AUTH_URL) {
+      onAuth?.();
+      return res(200);
+    }
+    if (url.includes("service-lines"))
+      return res(200, {
+        content: { results: [{ serviceLineNumber: "SL-1", accountReferenceId: "ACC-1" }] },
+      });
+    if (url.includes("/device-data/cache/v1/telemetry"))
+      return res(200, {
+        data: {
+          // The legend covers the whole row, kind column included — so DeviceId
+          // is the second entry, as it is on the wire.
+          columnNamesByDeviceType: { r: ["DeviceType", "DeviceId", "WifiHopsFromController"] },
+          values: [["r", TARGET, 0]],
+        },
+      });
+    return onDevice(init, url);
+  }) as typeof fetch;
+}
+
+describe("updateRouterConfig", () => {
+  const SUBNET = { kind: "subnet" as const, subnet: "192.168.2.1/24", password: "hunter2hunter2" };
 
   const stall = (init?: RequestInit) =>
     new Promise<Response>((_resolve, reject) => {
@@ -585,5 +592,78 @@ describe("updateRouterConfig", () => {
       handler.updateRouterConfig({ ...SUBNET, password: "short" }),
     ).resolves.toMatchObject({ status: 400 });
     expect(prepared).toBe(false);
+  });
+});
+
+// The roster and the config read the same way the writes are sent: named by the
+// account, carried over the gateway. That is what makes them answer for a router
+// this machine cannot reach — a kit in bypass, or a viewer somewhere else.
+describe("router reads over the gateway", () => {
+  /** An empty grpc-web frame — enough for a reader that only needs its bytes. */
+  const emptyFrame = () =>
+    ({
+      status: 200,
+      ok: true,
+      headers: { get: () => null },
+      arrayBuffer: async () => new Uint8Array([0, 0, 0, 0, 0]).buffer,
+    }) as unknown as Response;
+
+  it("given: a roster read, should: ask the account's controller and serve what it reports", async () => {
+    const asked: string[] = [];
+    const handler = createCloudHandler({
+      fetch: gateway(async () => emptyFrame()),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      readRouterClients: async (targetId, callGateway) => {
+        asked.push(targetId);
+        await callGateway(new Uint8Array([1]));
+        return [{ clientId: 7, macAddress: "aa:bb:cc:00:00:00" }];
+      },
+    });
+
+    await expect(handler.handle("/cloud/router-clients")).resolves.toEqual({
+      status: 200,
+      body: { clients: [{ clientId: 7, macAddress: "aa:bb:cc:00:00:00" }] },
+    });
+    expect(asked).toEqual([TARGET]);
+  });
+
+  it("given: a config read, should: serve the block the router reports", async () => {
+    const handler = createCloudHandler({
+      fetch: gateway(async () => res(200)),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      readRouterConfig: async () => ({ countryCode: "US" }),
+    });
+
+    await expect(handler.handle("/cloud/router-config")).resolves.toEqual({
+      status: 200,
+      body: { wifiConfig: { countryCode: "US" } },
+    });
+  });
+
+  it("given: a host that binds no reader, should: say so rather than answer emptily", async () => {
+    const handler = createCloudHandler({
+      fetch: gateway(async () => res(200)),
+      readCookie: () => SESSION,
+    });
+
+    await expect(handler.handle("/cloud/router-clients")).resolves.toMatchObject({ status: 503 });
+    await expect(handler.handle("/cloud/router-config")).resolves.toMatchObject({ status: 503 });
+  });
+
+  it("given: no session, should: prompt a reconnect without reading anything", async () => {
+    let read = false;
+    const handler = createCloudHandler({
+      fetch: gateway(async () => res(200)),
+      readCookie: () => null,
+      readRouterClients: async () => {
+        read = true;
+        return [];
+      },
+    });
+
+    await expect(handler.handle("/cloud/router-clients")).resolves.toMatchObject({ status: 428 });
+    expect(read).toBe(false);
   });
 });

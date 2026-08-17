@@ -88,6 +88,16 @@ const DEVICE_HANDLE = `${API}/SpaceX.API.Device.Device/Handle`;
 const REFRESH_TTL_MS = 60_000; // the Access.V1 token is short-lived; refresh at most this often
 const IDS_TTL_MS = 5 * 60_000; // account/service-line numbers change ~never; cache across routes
 
+/** The account has not named a router this write could target. Nothing is wrong
+ *  with the session or the connection: the telemetry feed is momentarily empty,
+ *  and it fills in again on its own — so this must not read as a fault. */
+export class ControllerUnknownError extends Error {
+  constructor() {
+    super("Starlink has not reported a router on this account yet");
+    this.name = "ControllerUnknownError";
+  }
+}
+
 /** The account session is gone or expired — the UI must prompt a reconnect, NOT
  *  show a generic "check your internet". Distinct from a real upstream fault. */
 export class SessionExpiredError extends Error {
@@ -117,9 +127,16 @@ export interface CloudHandlerOptions {
   retryDelayMs?: number;
   /** Maximum time for each remote router mutation attempt. */
   deviceCallTimeoutMs?: number;
-  /** Trusted host callback: reads the local router and encodes exactly one
-   *  client update. Renderer-provided protobuf is never accepted. */
-  prepareDeviceUpdate?: (update: RouterClientUpdate) => Promise<Uint8Array>;
+  /** Trusted host callback: reads what the write must preserve — through the same
+   *  gateway, against the target this handler resolved from the account — and
+   *  encodes exactly one client update. Renderer-provided protobuf is never
+   *  accepted. Touching no LAN is what lets a bypassed router, invisible on the
+   *  local network by definition, still have its devices paused and renamed. */
+  prepareDeviceUpdate?: (
+    update: RouterClientUpdate,
+    targetId: string,
+    callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
+  ) => Promise<Uint8Array>;
   /** Same trust boundary as prepareDeviceUpdate, for WifiConfig-level writes
    *  (custom DNS today; bypass mode and content filtering once each has had
    *  its own careful verification -- see routerWifiConfigUpdate.ts). */
@@ -145,11 +162,34 @@ export interface CloudHandlerOptions {
     targetId: string,
     callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
   ) => Promise<string | null>;
+  /** Trusted host callback: reads the connected-device roster through the same
+   *  gateway — the one reader that answers away from home, and for a router the
+   *  LAN cannot see. */
+  readRouterClients?: (
+    targetId: string,
+    callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
+  ) => Promise<unknown[]>;
+  /** Trusted host callback: reads the router's whole WiFi config through the same
+   *  gateway — SSIDs, mesh nodes, saved device names. */
+  readRouterConfig?: (
+    targetId: string,
+    callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
+  ) => Promise<unknown>;
 }
 
 /** The durable half of the session — without it a token refresh can't happen, so
  *  a session missing it is definitely not usable. */
 const SSO_COOKIE_RE = /Starlink\.Com\.Sso=/;
+
+/** Answered wherever a router has to be named, so every surface says the same
+ *  waitable thing rather than reporting an outage. */
+const NO_CONTROLLER: CloudResult = {
+  status: 503,
+  body: {
+    error: "router_not_reported",
+    message: "Starlink hasn't reported your router yet — try again in a minute.",
+  },
+};
 
 const NOT_CONNECTED: CloudResult = {
   status: 428,
@@ -233,6 +273,8 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
   const prepareDishUpdate = options.prepareDishUpdate;
   const prepareRouterConfigUpdate = options.prepareRouterConfigUpdate;
   const readRouterSubnet = options.readRouterSubnet;
+  const readRouterClients = options.readRouterClients;
+  const readRouterConfig = options.readRouterConfig;
 
   let cachedCookie: string | null = null;
   let cachedAt = 0;
@@ -317,20 +359,27 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     }
   }
 
-  async function apiGet(path: string, cookie: string): Promise<unknown> {
+  async function apiGet(path: string, cookie: string, abortSignal?: AbortSignal): Promise<unknown> {
     const response = await doFetch(`${API}${path}`, {
       headers: { cookie, accept: "application/json" },
+      signal: abortSignal,
     });
     if (response.status === 401 || response.status === 403) throw new SessionExpiredError();
     if (!response.ok) throw new Error(`GET ${path} → HTTP ${response.status}`);
     return response.json();
   }
 
-  async function apiPost(path: string, cookie: string, body: unknown): Promise<unknown> {
+  async function apiPost(
+    path: string,
+    cookie: string,
+    body: unknown,
+    abortSignal?: AbortSignal,
+  ): Promise<unknown> {
     const response = await doFetch(`${API}${path}`, {
       method: "POST",
       headers: { cookie, accept: "application/json", "content-type": "application/json" },
       body: JSON.stringify(body),
+      signal: abortSignal,
     });
     if (response.status === 401 || response.status === 403) throw new SessionExpiredError();
     if (!response.ok) throw new Error(`POST ${path} → HTTP ${response.status}`);
@@ -367,11 +416,15 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
 
   /** Resolve the account number + primary service line the UI hangs everything
    *  off. Cached briefly so /cloud/account and /cloud/usage don't each re-list. */
-  async function resolveIds(cookie: string): Promise<{ acc: string; sl: string }> {
+  async function resolveIds(
+    cookie: string,
+    abortSignal?: AbortSignal,
+  ): Promise<{ acc: string; sl: string }> {
     if (cachedIds && Date.now() - cachedIdsAt < IDS_TTL_MS) return cachedIds;
     const list = (await apiGet(
       "/webagg/v2/accounts/service-lines?limit=100&page=0&isConverting=false&serviceAddressId=&onlyActive=false&searchString=&onlyNoUts=false",
       cookie,
+      abortSignal,
     )) as { content?: { results?: ServiceLineResult[] } };
     const first = list.content?.results?.[0];
     if (!first?.serviceLineNumber || !first?.accountReferenceId) {
@@ -392,25 +445,49 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
    * whole reason a bypassed kit, which answers nothing on the LAN, can still be
    * configured.
    */
-  async function resolveControllerId(cookie: string): Promise<string> {
+  async function resolveControllerId(cookie: string, abortSignal?: AbortSignal): Promise<string> {
     if (cachedControllerId && Date.now() - cachedControllerIdAt < IDS_TTL_MS) {
       return cachedControllerId;
     }
-    const { acc } = await resolveIds(cookie);
-    const telemetry = await apiPost("/device-data/cache/v1/telemetry", cookie, {
-      accountNumber: acc,
-    });
+    const { acc } = await resolveIds(cookie, abortSignal);
+    const telemetry = await apiPost(
+      "/device-data/cache/v1/telemetry",
+      cookie,
+      { accountNumber: acc },
+      abortSignal,
+    );
     const routers = Object.entries(deviceTelemetryFrom(telemetry)).filter(
       ([, device]) => device.kind === "router",
     );
-    if (routers.length === 0) throw new Error("no Starlink router on this account");
+    if (routers.length === 0) throw new ControllerUnknownError();
     const controller =
       routers.find(([, device]) => device.hops === 0) ??
       (routers.length === 1 ? routers[0] : undefined);
-    if (!controller) throw new Error("could not tell which router is the controller");
+    if (!controller) throw new ControllerUnknownError();
     cachedControllerId = controller[0];
     cachedControllerIdAt = Date.now();
     return cachedControllerId;
+  }
+
+  /** Run one bounded read against the account's controller: resolve the target,
+   *  hand the callback a gateway bound to a fresh token, and let a session miss
+   *  heal the way every other call here does. */
+  async function withRouterGateway<T>(
+    run: (
+      targetId: string,
+      callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
+    ) => Promise<T>,
+  ): Promise<T> {
+    const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
+    return withFreshCookie(async (cookie) => {
+      const targetId = await resolveControllerId(cookie, abortSignal);
+      return run(targetId, (requestBytes) =>
+        grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
+          fetch: doFetch,
+          headers: { cookie },
+        }),
+      );
+    }, abortSignal);
   }
 
   /** `route` is the path without query, e.g. "/cloud/account". */
@@ -450,22 +527,32 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
       }
       if (route === "/cloud/router-subnet") {
         if (!readRouterSubnet) return { status: 503, body: { error: "router_subnet_unavailable" } };
-        const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
-        const subnet = await withFreshCookie(async (cookie) => {
-          const targetId = await resolveControllerId(cookie);
-          return readRouterSubnet(targetId, (requestBytes) =>
-            grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
-              fetch: doFetch,
-              headers: { cookie },
-            }),
-          );
-        }, abortSignal);
+        const subnet = await withRouterGateway(readRouterSubnet);
         return { status: 200, body: { subnet } };
+      }
+      // The roster the LAN normally serves, sourced from the account instead. It
+      // is the same list — the router reports its devices to Starlink whether or
+      // not this machine can reach it — so it answers the two cases the LAN read
+      // cannot: away from home, and a router the local network cannot see.
+      if (route === "/cloud/router-clients") {
+        if (!readRouterClients)
+          return { status: 503, body: { error: "router_clients_unavailable" } };
+        const clients = await withRouterGateway(readRouterClients);
+        return { status: 200, body: { clients } };
+      }
+      // GET reads the config the writes on this route change. Names, mesh nodes,
+      // and SSIDs all live here, so a roster read from the account has somewhere
+      // to get them from.
+      if (route === "/cloud/router-config") {
+        if (!readRouterConfig) return { status: 503, body: { error: "router_config_unavailable" } };
+        const wifiConfig = await withRouterGateway(readRouterConfig);
+        return { status: 200, body: { wifiConfig } };
       }
       return { status: 404, body: { error: "unknown_cloud_route", route } };
     } catch (error) {
       // A dead session is a reconnect prompt (428), not a network fault (502).
       if (error instanceof SessionExpiredError) return NOT_CONNECTED;
+      if (error instanceof ControllerUnknownError) return NO_CONTROLLER;
       return { status: 502, body: { error: "upstream_failed", message: (error as Error).message } };
     }
   }
@@ -516,23 +603,20 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
       // mutation cannot be built from a snapshot predating an earlier write.
       if (!prepareDeviceUpdate)
         return { status: 503, body: { error: "device_update_unavailable" } };
-      const requestBytes = await prepareDeviceUpdate(update);
-      const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
-      await withFreshCookie(async (cookie) => {
+      await withRouterGateway(async (targetId, callGateway) => {
+        const requestBytes = await prepareDeviceUpdate(update, targetId, callGateway);
         try {
-          await grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
-            fetch: doFetch,
-            headers: { cookie },
-          });
+          await callGateway(requestBytes);
         } catch (error) {
           if (error instanceof GrpcWebError && error.grpcStatus === 16)
             throw new SessionExpiredError();
           throw error;
         }
-      }, abortSignal);
+      });
       return { status: 200, body: { ok: true } };
     } catch (error) {
       if (error instanceof SessionExpiredError) return NOT_CONNECTED;
+      if (error instanceof ControllerUnknownError) return NO_CONTROLLER;
       if (error instanceof DOMException && error.name === "TimeoutError") {
         return {
           status: 504,
@@ -915,7 +999,7 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
         return { status: 503, body: { error: "router_config_update_unavailable" } };
       const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
       await withFreshCookie(async (cookie) => {
-        const targetId = await resolveControllerId(cookie);
+        const targetId = await resolveControllerId(cookie, abortSignal);
         const callGateway = (requestBytes: Uint8Array) =>
           grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
             fetch: doFetch,
@@ -934,6 +1018,7 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
       return { status: 200, body: { ok: true } };
     } catch (error) {
       if (error instanceof SessionExpiredError) return NOT_CONNECTED;
+      if (error instanceof ControllerUnknownError) return NO_CONTROLLER;
       // A subnet change and a bypass switch both reconfigure the LAN carrying
       // them, so a write that takes effect kills its own reply. How that surfaces
       // is the host's business: a deadline where the request is left hanging, a

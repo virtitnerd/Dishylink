@@ -4,14 +4,25 @@
 // This file is the router: it owns the tab, resolves `selectedKey` to a node or
 // a device, and hands off. The rows and both detail views live beside it.
 
-import { useMemo, useState } from "react";
-import type { RouterNetwork } from "../../hooks/useRouterNetwork";
+import { useEffect, useMemo, useState } from "react";
+import {
+  CLIENTS_POLL_MS,
+  CLOUD_CLIENTS_POLL_MS,
+  type RouterNetwork,
+} from "../../hooks/useRouterNetwork";
 import { useRadioTemps } from "../../hooks/useRadioTemps";
 import { useSelfIdentity } from "../../hooks/useSelfIdentity";
+import { useRememberSelfDevice } from "../../hooks/useRememberSelfDevice";
 import { matchesSelf, selfIdentified } from "../../lib/selfIdentity";
 import { selfDeviceHost } from "../../lib/selfDeviceHost";
+import {
+  accountRosterNoticeDismissed,
+  setAccountRosterNoticeDismissed,
+} from "../../lib/accountRosterNotice";
 import { requestPanel } from "../../hooks/usePanelRouting";
 import { useCloudAccount } from "../../hooks/useCloudAccount";
+import { AccountRequiredNotice } from "../shared/AccountRequiredNotice";
+import { AccountRosterOffer } from "./AccountRosterOffer";
 import { inlineLinkButton } from "../ui/action-button";
 import type { RouterUnreachable } from "../../lib/routerDiagnosis";
 import { DetailsModal } from "../ui/details-modal";
@@ -79,6 +90,7 @@ function NetworkPanelBody({
   const radio = useRadioTemps();
   // The viewer's own address(es), to flag "This device" in the list.
   const { self, resolved: selfResolved } = useSelfIdentity();
+  useRememberSelfDevice(network.clients, network.clientsSource, self);
   // The odometer's records, for the split-record question below the device list.
   // The rows themselves come from the router and know nothing about stored totals.
   const { totals, mergeCandidates, writeError, answerMerge } = useClientTotals();
@@ -87,6 +99,16 @@ function NetworkPanelBody({
   const { status: cloudStatus } = useCloudAccount(true);
   const needsAccount = cloudStatus !== "loading" && cloudStatus !== "ready";
   const needsSelfDevice = selfDeviceHost() !== null && selfResolved && !selfIdentified(self);
+
+  /** The LAN is silent and the account is answering in its place. */
+  const viaCloud = network.clientsSource === "cloud";
+  const [noticeDismissed, setNoticeDismissed] = useState(accountRosterNoticeDismissed);
+  // The router answering again retires the dismissal, so the next outage is
+  // surfaced as the fresh event it is rather than inheriting an older answer.
+  if (noticeDismissed && network.clientsSource === "lan") setNoticeDismissed(false);
+  useEffect(() => {
+    if (network.clientsSource === "lan") setAccountRosterNoticeDismissed(false);
+  }, [network.clientsSource]);
 
   const devices = useMemo(() => network.clients.filter(isClientDevice), [network.clients]);
   // The viewer's own device pins to the top (like the app), then by throughput.
@@ -110,8 +132,27 @@ function NetworkPanelBody({
   }
   // Branch on the diagnosis rather than on `routerReachable` again: it is
   // derived from that same flag, so this cannot render an empty callout.
-  if (unreachable) {
-    return <Callout tone='error'>{unreachable.message}</Callout>;
+  //
+  // A roster read through the account is not a degraded stand-in for this list —
+  // it IS this list, from the one reader that still reaches the router. So the
+  // silence is explained above the devices rather than shown instead of them.
+  if (unreachable && !viaCloud) {
+    return (
+      <div>
+        <Callout tone='error'>{unreachable.message}</Callout>
+        {needsAccount ? (
+          <div className='mt-3 text-[12.5px] text-muted-foreground'>
+            <AccountRequiredNotice />
+          </div>
+        ) : (
+          <AccountRosterOffer
+            status={network.accountRosterStatus}
+            error={network.accountRosterError}
+            onConnect={network.readRosterViaAccount}
+          />
+        )}
+      </div>
+    );
   }
 
   const nodes = buildNodeRoster(network.clients, network.wifiConfig);
@@ -140,6 +181,10 @@ function NetworkPanelBody({
       <DeviceDetail
         client={selected}
         rates={network.rates}
+        liveRatesAvailable={!viaCloud}
+        historianAnswering={network.historianAnswering}
+        routerReachable={network.routerReachable}
+        rosterRefreshMs={viaCloud ? CLOUD_CLIENTS_POLL_MS : CLIENTS_POLL_MS}
         total={network.totals.get(usageKey(selected.clientId, selected.macAddress))}
         history={
           network.throughputHistory.get(usageKey(selected.clientId, selected.macAddress)) || []
@@ -168,10 +213,37 @@ function NetworkPanelBody({
         ]}
       />
 
+      {/* Above both tabs: everything under them is coming from the account, not
+          from the router on this network. */}
+      {viaCloud && !noticeDismissed && (
+        <Callout
+          tone='info'
+          className='mb-2.5'
+          dismissLabel='Dismiss this note'
+          onDismiss={() => {
+            setAccountRosterNoticeDismissed(true);
+            setNoticeDismissed(true);
+          }}
+        >
+          {unreachable ? `${unreachable.message} ` : ""}These devices come from your Starlink
+          account, so they refresh every {CLOUD_CLIENTS_POLL_MS / 1000}&nbsp;s and carry no live
+          throughput.
+        </Callout>
+      )}
+
       {tab === "connected" && (
         <>
+          {viaCloud && network.accountRosterError && (
+            <div className='mb-2 text-[11.5px] text-destructive'>{network.accountRosterError}</div>
+          )}
           <ListSection
-            caption={`${devices.length} device${devices.length === 1 ? "" : "s"} · live from the router, refreshed every 5 s`}
+            caption={`${devices.length} device${devices.length === 1 ? "" : "s"} · ${
+              viaCloud
+                ? network.accountRosterError
+                  ? "via your Starlink account, no longer refreshing"
+                  : `via your Starlink account, refreshed every ${CLOUD_CLIENTS_POLL_MS / 1000} s`
+                : `live from the router, refreshed every ${CLIENTS_POLL_MS / 1000} s`
+            }`}
           >
             {sortedDevices.map((client, index) => (
               <DeviceRow

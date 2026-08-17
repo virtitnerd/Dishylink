@@ -16,8 +16,9 @@ import { DeviceSignalIcon } from "../../assets/icons/DeviceSignalIcon";
 import { DeviceThroughput } from "./DeviceThroughput";
 import { buildDeviceFacts } from "./deviceFacts";
 import { deviceRowSubtitle } from "./deviceRowSubtitle";
-import { displayName, signalQuality } from "./networkFormat";
+import { displayName, pauseSettleTimeoutMs, signalQuality } from "./networkFormat";
 import { Button } from "../ui/button";
+import { SpinLoader } from "../loaders/SpinLoader";
 import {
   AccountRequiredError,
   clientPauseControlAvailable,
@@ -34,16 +35,14 @@ import {
   DialogTitle,
 } from "../ui/dialog";
 
-// The router's client roster is what says whether a pause landed, and it is polled
-// on its own 5s cadence. Holding the control pending until that roster agrees is
-// what keeps the label from flicking back through its old value in between. The
-// timeout is the backstop for a write the gateway accepts but never applies.
-const PAUSE_SETTLE_TIMEOUT_MS = 20_000;
-
 export function DeviceDetail({
   client,
   history,
   rates,
+  liveRatesAvailable,
+  historianAnswering,
+  routerReachable,
+  rosterRefreshMs,
   total,
   upstreamName,
   isThisDevice,
@@ -53,6 +52,17 @@ export function DeviceDetail({
   client: WifiClientJson;
   /** Live per-MAC rates from the hook's byte-delta tracker. */
   rates: Map<string, ThroughputRates>;
+  /** Whether that tracker is still being fed. It runs on the LAN, so a roster
+   *  sourced from the account has no current entry in it — only whatever it held
+   *  when the router last answered, which would be shown as if it were live. */
+  liveRatesAvailable: boolean;
+  /** The historian feeds the charts and the router feeds the roster, so an empty
+   *  chart has to name whichever of the two is silent. */
+  historianAnswering: boolean | null;
+  routerReachable: boolean | null;
+  /** How often the roster on screen is re-read, which is how long a pause can
+   *  take to be confirmed. */
+  rosterRefreshMs: number;
   history: TelemetrySample[];
   /** This device's monthly usage from the historian's odometer, if it has one. */
   total?: ClientUsageTotal;
@@ -90,11 +100,11 @@ export function DeviceDetail({
       setPauseError(
         new Error("The router has not applied this yet. Give it a moment, then try again."),
       );
-    }, PAUSE_SETTLE_TIMEOUT_MS);
+    }, pauseSettleTimeoutMs(rosterRefreshMs));
     return () => {
       window.clearTimeout(timer);
     };
-  }, [pendingPaused]);
+  }, [pendingPaused, rosterRefreshMs]);
 
   const applyPaused = async (next: boolean) => {
     if (client.clientId === undefined || pauseBusy || !showPauseControl) return;
@@ -112,11 +122,14 @@ export function DeviceDetail({
   const name = displayName(client);
   // Byte-delta rate, so the headline number matches a speed test instead of the
   // router's 60-second average of it. Falls back until the second reading lands.
-  const liveRate = client.macAddress
-    ? rates.get(usageKey(client.clientId, client.macAddress))
-    : undefined;
-  const downMbps = liveRate?.downMbps ?? throughputMbps(client.rxStats);
-  const upMbps = liveRate?.upMbps ?? throughputMbps(client.txStats);
+  const liveRate =
+    liveRatesAvailable && client.macAddress
+      ? rates.get(usageKey(client.clientId, client.macAddress))
+      : undefined;
+  const downMbps = liveRatesAvailable
+    ? (liveRate?.downMbps ?? throughputMbps(client.rxStats))
+    : null;
+  const upMbps = liveRatesAvailable ? (liveRate?.upMbps ?? throughputMbps(client.txStats)) : null;
 
   const facts = buildDeviceFacts({
     client,
@@ -169,20 +182,24 @@ export function DeviceDetail({
             <Button
               variant={paused ? "outline" : "secondary"}
               size='sm'
-              className='cursor-pointer disabled:cursor-not-allowed'
+              className='min-w-[5.5rem] cursor-pointer disabled:cursor-not-allowed disabled:opacity-100'
               disabled={pauseBusy}
               onClick={() => {
                 if (paused) void applyPaused(false);
                 else setConfirmingPause(true);
               }}
             >
-              {pauseBusy
-                ? pendingPaused
-                  ? "Pausing…"
-                  : "Unpausing…"
-                : paused
-                  ? "Unpause"
-                  : "Pause"}
+              {pauseBusy ? (
+                <SpinLoader
+                  variant='segment'
+                  size={16}
+                  label={pendingPaused ? "Pausing" : "Unpausing"}
+                />
+              ) : paused ? (
+                "Unpause"
+              ) : (
+                "Pause"
+              )}
             </Button>
           )}
         </div>
@@ -246,7 +263,13 @@ export function DeviceDetail({
 
       <DeviceFactsList facts={facts} />
 
-      <DeviceThroughput history={history} downMbps={downMbps} upMbps={upMbps} />
+      <DeviceThroughput
+        history={history}
+        downMbps={downMbps}
+        upMbps={upMbps}
+        historianAnswering={historianAnswering}
+        routerReachable={routerReachable}
+      />
     </div>
   );
 }

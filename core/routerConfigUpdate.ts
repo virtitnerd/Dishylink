@@ -11,6 +11,7 @@
 // mode has no reachable router on the local network at all, and its target comes
 // from the account.
 
+import type { WifiNetworkConfigJson } from "./dishClient";
 import { normalizeIpAddress } from "./ipAddress";
 
 /** The most the router's own app offers: one primary and three backups. */
@@ -150,6 +151,25 @@ interface RouterCodec {
 }
 
 /**
+ * The router's whole WiFi configuration, over the caller's gateway.
+ *
+ * The same block the LAN serves — SSIDs, mesh nodes, saved device names — for a
+ * router the local network cannot reach. Null when the reply carries none.
+ */
+export async function readRouterWifiConfig(
+  codec: RouterCodec,
+  targetId: string,
+  callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
+): Promise<WifiNetworkConfigJson | null> {
+  const reply = await codec.decodeResponse(
+    await callGateway(await codec.encodeRequest({ targetId, wifiGetConfig: {} })),
+  );
+  // The codec is described loosely on purpose — only the write path here reads
+  // into the reply — so the shape is named once, at this boundary.
+  return (reply.wifiGetConfig?.wifiConfig as WifiNetworkConfigJson | undefined) ?? null;
+}
+
+/**
  * The networks a write must preserve, fetched through the caller's gateway.
  *
  * Only a subnet change needs them, so every other update skips the round trip
@@ -170,10 +190,8 @@ async function readRouterNetworks(
   targetId: string,
   callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
 ): Promise<Json[]> {
-  const reply = await codec.decodeResponse(
-    await callGateway(await codec.encodeRequest({ targetId, wifiGetConfig: {} })),
-  );
-  return (reply.wifiGetConfig?.wifiConfig?.networks as Json[] | undefined) ?? [];
+  const config = await readRouterWifiConfig(codec, targetId, callGateway);
+  return (config?.networks as Json[] | undefined) ?? [];
 }
 
 /**
