@@ -25,14 +25,6 @@ export async function applyRouterWifiConfigUpdate(
   throw new Error(`Starlink rejected the WiFi config update: ${message}`);
 }
 
-export async function setRouterCustomDns(nameservers: string[], disabled: boolean): Promise<void> {
-  await applyRouterWifiConfigUpdate({ kind: "dns", nameservers, disabled });
-}
-
-export async function setRouterBypassMode(enabled: boolean): Promise<void> {
-  await applyRouterWifiConfigUpdate({ kind: "bypassMode", enabled });
-}
-
 export async function setRouterContentFiltering(
   level: 0 | 1 | 2,
   allowDomains?: string[],

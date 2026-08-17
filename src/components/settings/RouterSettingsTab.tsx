@@ -28,7 +28,6 @@ import type { RouterUnreachable } from "../../lib/routerDiagnosis";
 import { Badge } from "@/components/ui/badge";
 import {
   DangerAction,
-  DangerToggle,
   SectionLabel,
   SettingRow,
   selectContentClass,
@@ -37,6 +36,9 @@ import {
 } from "./settingsChrome";
 import { RouterAddressRow } from "./RouterAddressRow";
 import { SubnetSection } from "./SubnetSection";
+import { CustomDnsSection } from "./CustomDnsSection";
+import { BypassSection } from "./BypassSection";
+import type { CloudAccount } from "../../lib/starlinkCloud";
 import { routerAddressForSubnet } from "@core/routerConfigUpdate";
 import { routerAddressHost } from "../../lib/routerAddressHost";
 import { applyRouterConfigUpdate } from "../../lib/routerConfigUpdate";
@@ -49,9 +51,7 @@ import {
   networkModeOf,
   setMeshNodeTrust,
   setRouterAdvanced,
-  setRouterBypassMode,
   setRouterContentFiltering,
-  setRouterCustomDns,
   setRouterNetworkSettings,
   setRouterWifiSsid,
   type NetworkMode,
@@ -224,6 +224,16 @@ function draftFrom(network: WifiLanNetworkJson) {
 }
 type NetworkDraft = ReturnType<typeof draftFrom>;
 
+/** The controller's bypass state, or null when the account has not said. A mesh
+ *  node reports as a router too and is never the bypassed one, so the controller
+ *  is picked the way the cloud handler picks its write target: zero hops. */
+function controllerBypassed(account: CloudAccount | null): boolean | null {
+  for (const device of Object.values(account?.deviceTelemetry ?? {})) {
+    if (device.kind === "router" && device.hops === 0) return device.isBypassed ?? null;
+  }
+  return null;
+}
+
 export function RouterSettingsTab({
   wifiConfig,
   routerReachable,
@@ -258,6 +268,16 @@ export function RouterSettingsTab({
   const { data: cloudSubnet, reload: rereadCloudSubnet } = useCloudRouterSubnet(
     cloudConnected && lanSubnet === null,
   );
+
+  // Only the rows that ask the router something over the LAN wait on it. Bypass
+  // mode is the one Advanced control that must keep working when this is false --
+  // that's the whole point of it riding the account instead (see BypassSection's
+  // own header comment).
+  const answering = routerReachable !== null && !unreachable && wifiConfig !== null;
+  const showDns = answering && !wifiConfig?.customDnsDisabled;
+  // Read from the account rather than the router: a bypassed router answers
+  // nothing on the LAN, so `wifiConfig` is silent exactly when the answer is yes.
+  const bypassed = controllerBypassed(cloudAccount.data);
 
   const [editingDomain, setEditingDomain] = useState<string | null>(null);
   const [draft, setDraft] = useState<NetworkDraft | null>(null);
@@ -395,32 +415,6 @@ export function RouterSettingsTab({
     }
   };
 
-  const [dnsDraft, setDnsDraft] = useState(() => wifiConfig?.nameservers?.join(", ") ?? "");
-  const [dnsSaving, setDnsSaving] = useState(false);
-  const [dnsResult, setDnsResult] = useState<string | null>(null);
-  const [prevNameserversForDraft, setPrevNameserversForDraft] = useState(wifiConfig?.nameservers);
-  if (wifiConfig?.nameservers !== prevNameserversForDraft) {
-    setPrevNameserversForDraft(wifiConfig?.nameservers);
-    setDnsDraft(wifiConfig?.nameservers?.join(", ") ?? "");
-  }
-  const saveDns = async () => {
-    const nameservers = dnsDraft
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    setDnsSaving(true);
-    setDnsResult(null);
-    try {
-      await setRouterCustomDns(nameservers, nameservers.length === 0);
-      setDnsResult(nameservers.length ? "Saved — the router will pick it up shortly." : "Cleared.");
-    } catch (error) {
-      setDnsResult(`Failed: ${(error as Error).message}`);
-    } finally {
-      setDnsSaving(false);
-      window.setTimeout(() => setDnsResult(null), 4000);
-    }
-  };
-
   // Every radio/onboarding control below fires its own write immediately on
   // change (no separate edit-then-save step -- there's nothing to batch, each
   // is a single flat WifiConfig field), sharing one busy/result pair keyed by
@@ -462,514 +456,530 @@ export function RouterSettingsTab({
     }
   };
 
-  if (routerReachable === null) return <Loading message='Contacting the router…' />;
-  // Branch on the diagnosis rather than on `routerReachable` again: it is
-  // derived from that same flag, so this cannot render an empty callout.
-  if (unreachable) return <Callout tone='error'>{unreachable.message}</Callout>;
-  if (!wifiConfig) return null;
-
   return (
     <>
-      <SectionLabel>Networks</SectionLabel>
-      {networks.map((network, index) => {
-        const bands = network.basicServiceSets ?? [];
-        const primarySsid = bands[0]?.ssid ?? network.domain ?? `Network ${index + 1}`;
-        const isEditing = editingDomain === network.domain;
-        const isFirst = index === 0;
+      {routerReachable === null && <Loading message='Contacting the router…' />}
+      {/* Branch on the diagnosis rather than on `routerReachable` again: it is
+          derived from that same flag, so this cannot render an empty callout. */}
+      {unreachable && <Callout tone='error'>{unreachable.message}</Callout>}
 
-        return (
-          <div key={network.domain ?? index}>
-            <SettingRow
-              title={primarySsid}
-              caption={
-                cloudConnected
-                  ? `${MODE_LABEL[networkModeOf(network) ?? "default"]} · ${network.ipv4 ?? "—"}`
-                  : "WPA2 · password managed in the Starlink app"
-              }
-              note={isEditing ? result : null}
-            >
-              {[...new Set(bands.map((b) => b.band).filter(Boolean))].map((band) => (
-                <Badge key={band}>{BAND_LABEL[band!] ?? band}</Badge>
-              ))}
-              {cloudConnected && !isEditing && (
-                <button className={actionButton("subtle")} onClick={() => startEditing(network)}>
-                  Edit
-                </button>
-              )}
-            </SettingRow>
+      {answering && wifiConfig && (
+        <>
+          <SectionLabel>Networks</SectionLabel>
+          {networks.map((network, index) => {
+            const bands = network.basicServiceSets ?? [];
+            const primarySsid = bands[0]?.ssid ?? network.domain ?? `Network ${index + 1}`;
+            const isEditing = editingDomain === network.domain;
+            const isFirst = index === 0;
 
-            {isEditing && draft && (
-              <div className='mb-2.5 flex flex-col gap-2.5 rounded-md border border-hairline bg-[color-mix(in_srgb,var(--ink)_4%,var(--surface))] p-3'>
-                <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
-                  <Switch
-                    checked={draft.split}
-                    disabled={saving}
-                    onCheckedChange={(split) => setDraft({ ...draft, split })}
-                  />
-                  Use different names for 2.4GHz and 5GHz
-                </label>
-
-                {!draft.split ? (
-                  <>
-                    <FormRow label='Name'>
-                      <input
-                        type='text'
-                        className={textInputClass}
-                        value={draft.ssid}
-                        disabled={saving}
-                        onChange={(e) => setDraft({ ...draft, ssid: e.target.value })}
-                      />
-                    </FormRow>
-                    <FormRow label='Password'>
-                      <input
-                        type='text'
-                        placeholder='required — not read back from the router'
-                        className={monoInputClass}
-                        value={draft.password}
-                        disabled={saving}
-                        onChange={(e) => setDraft({ ...draft, password: e.target.value })}
-                      />
-                    </FormRow>
-                  </>
-                ) : (
-                  bands.map(
-                    (bss) =>
-                      bss.band && (
-                        <div
-                          key={bss.band}
-                          className='flex flex-col gap-1.5 border-l-2 border-hairline pl-2.5'
-                        >
-                          <span className='text-[11px] font-medium text-muted-foreground'>
-                            {BAND_LABEL[bss.band] ?? bss.band}
-                          </span>
-                          <FormRow label='Name'>
-                            <input
-                              type='text'
-                              className={textInputClass}
-                              value={draft.perBand[bss.band]?.ssid ?? ""}
-                              disabled={saving}
-                              onChange={(e) =>
-                                setDraft({
-                                  ...draft,
-                                  perBand: {
-                                    ...draft.perBand,
-                                    [bss.band!]: {
-                                      ...draft.perBand[bss.band!],
-                                      ssid: e.target.value,
-                                    },
-                                  },
-                                })
-                              }
-                            />
-                          </FormRow>
-                          <FormRow label='Password'>
-                            <input
-                              type='text'
-                              placeholder='required'
-                              className={monoInputClass}
-                              value={draft.perBand[bss.band]?.password ?? ""}
-                              disabled={saving}
-                              onChange={(e) =>
-                                setDraft({
-                                  ...draft,
-                                  perBand: {
-                                    ...draft.perBand,
-                                    [bss.band!]: {
-                                      ...draft.perBand[bss.band!],
-                                      password: e.target.value,
-                                    },
-                                  },
-                                })
-                              }
-                            />
-                          </FormRow>
-                        </div>
-                      ),
-                  )
-                )}
-
-                {/* Security type and per-band disable, independent of the
-                    split-name choice above -- the schema carries both on each
-                    BasicServiceSet regardless of whether its name is shared. */}
-                {bands.map(
-                  (bss) =>
-                    bss.band && (
-                      <div key={`sec-${bss.band}`} className='flex items-center gap-2'>
-                        <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>
-                          {BAND_LABEL[bss.band] ?? bss.band}
-                        </span>
-                        <Select
-                          value={draft.perBand[bss.band]?.security ?? "wpa2"}
-                          disabled={saving}
-                          onValueChange={(security) =>
-                            setDraft({
-                              ...draft,
-                              perBand: {
-                                ...draft.perBand,
-                                [bss.band!]: {
-                                  ...draft.perBand[bss.band!],
-                                  security: security as WifiSecurityType,
-                                },
-                              },
-                            })
-                          }
-                        >
-                          <SelectTrigger className={triggerClass} style={{ width: 150 }}>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent className={selectContentClass}>
-                            {SECURITY_OPTIONS.map((opt) => (
-                              <SelectItem key={opt} value={opt} className={selectItemClass}>
-                                {SECURITY_LABEL[opt]}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                        <label className='flex items-center gap-1.5 text-[12px] text-muted-foreground'>
-                          <Switch
-                            checked={Boolean(draft.perBand[bss.band]?.disable)}
-                            disabled={saving}
-                            onCheckedChange={(disable) =>
-                              setDraft({
-                                ...draft,
-                                perBand: {
-                                  ...draft.perBand,
-                                  [bss.band!]: { ...draft.perBand[bss.band!], disable },
-                                },
-                              })
-                            }
-                          />
-                          Off
-                        </label>
-                      </div>
-                    ),
-                )}
-
-                <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
-                  <Switch
-                    checked={draft.hidden}
-                    disabled={saving}
-                    onCheckedChange={(hidden) => setDraft({ ...draft, hidden })}
-                  />
-                  Hide this network
-                </label>
-
-                <FormRow label='Mode'>
-                  <Select
-                    value={draft.mode}
-                    disabled={saving}
-                    onValueChange={(mode) => setDraft({ ...draft, mode: mode as NetworkMode })}
-                  >
-                    <SelectTrigger className={triggerClass} style={{ width: 140 }}>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className={selectContentClass}>
-                      {(["default", "guest", "auto"] as const).map((mode) => (
-                        <SelectItem key={mode} value={mode} className={selectItemClass}>
-                          {MODE_LABEL[mode]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </FormRow>
-
-                <FormRow label='Subnet'>
-                  <Select
-                    value={draft.ipv4}
-                    disabled={saving}
-                    onValueChange={(ipv4) => setDraft({ ...draft, ipv4 })}
-                  >
-                    <SelectTrigger className={triggerClass} style={{ width: 160 }}>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className={selectContentClass}>
-                      {SUBNET_OPTIONS.map((subnet) => (
-                        <SelectItem
-                          key={subnet}
-                          value={subnet}
-                          className={selectItemClass}
-                          disabled={usedSubnets.has(subnet) && subnet !== network.ipv4}
-                        >
-                          {subnet}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </FormRow>
-
-                <button
-                  className={`${actionButton("subtle")} w-fit`}
-                  onClick={() => setDraft({ ...draft, advancedOpen: !draft.advancedOpen })}
+            return (
+              <div key={network.domain ?? index}>
+                <SettingRow
+                  title={primarySsid}
+                  caption={
+                    cloudConnected
+                      ? `${MODE_LABEL[networkModeOf(network) ?? "default"]} · ${network.ipv4 ?? "—"}`
+                      : "WPA2 · password managed in the Starlink app"
+                  }
+                  note={isEditing ? result : null}
                 >
-                  {draft.advancedOpen ? "Hide advanced" : "Advanced (not in the official app)"}
-                </button>
-                {draft.advancedOpen && (
-                  <div className='flex flex-col gap-2 border-l-2 border-hairline pl-2.5'>
-                    <FormRow label='DHCP start'>
-                      <input
-                        type='number'
-                        className={narrowInputClass}
-                        value={draft.dhcpv4Start}
-                        disabled={saving}
-                        onChange={(e) => setDraft({ ...draft, dhcpv4Start: e.target.value })}
-                      />
-                    </FormRow>
-                    <FormRow label='DHCP end'>
-                      <input
-                        type='number'
-                        className={narrowInputClass}
-                        value={draft.dhcpv4End}
-                        disabled={saving}
-                        onChange={(e) => setDraft({ ...draft, dhcpv4End: e.target.value })}
-                      />
-                    </FormRow>
-                    <FormRow label='Lease (s)'>
-                      <input
-                        type='number'
-                        className={narrowInputClass}
-                        value={draft.dhcpv4LeaseDurationS}
-                        disabled={saving}
-                        onChange={(e) =>
-                          setDraft({ ...draft, dhcpv4LeaseDurationS: e.target.value })
-                        }
-                      />
-                    </FormRow>
-                    <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
-                      <Switch
-                        checked={draft.dhcpDisabled}
-                        disabled={saving}
-                        onCheckedChange={(v) => setDraft({ ...draft, dhcpDisabled: v })}
-                      />
-                      Disable DHCP on this network
-                    </label>
-                    <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
-                      <Switch
-                        checked={draft.dnsDisabled}
-                        disabled={saving}
-                        onCheckedChange={(v) => setDraft({ ...draft, dnsDisabled: v })}
-                      />
-                      Disable DNS on this network
-                    </label>
-                    <div className='flex flex-col gap-1'>
-                      <span className='text-[12px] text-muted-foreground'>
-                        Static DNS — one per line, domain(s)=address(es)
-                      </span>
-                      <textarea
-                        className={textareaClass}
-                        placeholder='myserver.local=192.168.1.50'
-                        rows={2}
-                        value={draft.dnsStaticEntriesText}
-                        disabled={saving}
-                        onChange={(e) =>
-                          setDraft({ ...draft, dnsStaticEntriesText: e.target.value })
-                        }
-                      />
-                    </div>
-                    <div className='flex flex-col gap-1'>
-                      <span className='text-[12px] text-muted-foreground'>
-                        DNS forwarding — one per line, domain(s)=server(s)
-                      </span>
-                      <textarea
-                        className={textareaClass}
-                        placeholder='corp.example=10.0.0.1'
-                        rows={2}
-                        value={draft.dnsForwardRulesText}
-                        disabled={saving}
-                        onChange={(e) =>
-                          setDraft({ ...draft, dnsForwardRulesText: e.target.value })
-                        }
-                      />
-                    </div>
-                    <div className='flex flex-col gap-1'>
-                      <span className='text-[12px] text-muted-foreground'>
-                        Static routes — one per line, subnet=gateway
-                      </span>
-                      <textarea
-                        className={textareaClass}
-                        placeholder='10.10.0.0/24=192.168.1.5'
-                        rows={2}
-                        value={draft.staticRoutesText}
-                        disabled={saving}
-                        onChange={(e) => setDraft({ ...draft, staticRoutesText: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                )}
-
-                <div className='flex items-center gap-2'>
-                  <button
-                    className={actionButton("subtle")}
-                    disabled={saving}
-                    onClick={() => void saveNetwork(network)}
-                  >
-                    {saving ? "Saving…" : "Save"}
-                  </button>
-                  <button
-                    className={actionButton("subtle")}
-                    disabled={saving}
-                    onClick={() => setEditingDomain(null)}
-                  >
-                    Cancel
-                  </button>
-                  {!isFirst && deletingDomain !== network.domain && (
+                  {[...new Set(bands.map((b) => b.band).filter(Boolean))].map((band) => (
+                    <Badge key={band}>{BAND_LABEL[band!] ?? band}</Badge>
+                  ))}
+                  {cloudConnected && !isEditing && (
                     <button
-                      className={actionButton("danger")}
-                      disabled={saving}
-                      onClick={() => setDeletingDomain(network.domain ?? null)}
+                      className={actionButton("subtle")}
+                      onClick={() => startEditing(network)}
                     >
-                      Delete network
+                      Edit
                     </button>
                   )}
-                </div>
+                </SettingRow>
 
-                {deletingDomain === network.domain && (
-                  <DeleteNetworkConfirm
-                    domain={network.domain!}
-                    onCancel={() => setDeletingDomain(null)}
-                    onDeleted={() => {
-                      setDeletingDomain(null);
-                      setEditingDomain(null);
-                    }}
-                  />
+                {isEditing && draft && (
+                  <div className='mb-2.5 flex flex-col gap-2.5 rounded-md border border-hairline bg-[color-mix(in_srgb,var(--ink)_4%,var(--surface))] p-3'>
+                    <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
+                      <Switch
+                        checked={draft.split}
+                        disabled={saving}
+                        onCheckedChange={(split) => setDraft({ ...draft, split })}
+                      />
+                      Use different names for 2.4GHz and 5GHz
+                    </label>
+
+                    {!draft.split ? (
+                      <>
+                        <FormRow label='Name'>
+                          <input
+                            type='text'
+                            className={textInputClass}
+                            value={draft.ssid}
+                            disabled={saving}
+                            onChange={(e) => setDraft({ ...draft, ssid: e.target.value })}
+                          />
+                        </FormRow>
+                        <FormRow label='Password'>
+                          <input
+                            type='text'
+                            placeholder='required — not read back from the router'
+                            className={monoInputClass}
+                            value={draft.password}
+                            disabled={saving}
+                            onChange={(e) => setDraft({ ...draft, password: e.target.value })}
+                          />
+                        </FormRow>
+                      </>
+                    ) : (
+                      bands.map(
+                        (bss) =>
+                          bss.band && (
+                            <div
+                              key={bss.band}
+                              className='flex flex-col gap-1.5 border-l-2 border-hairline pl-2.5'
+                            >
+                              <span className='text-[11px] font-medium text-muted-foreground'>
+                                {BAND_LABEL[bss.band] ?? bss.band}
+                              </span>
+                              <FormRow label='Name'>
+                                <input
+                                  type='text'
+                                  className={textInputClass}
+                                  value={draft.perBand[bss.band]?.ssid ?? ""}
+                                  disabled={saving}
+                                  onChange={(e) =>
+                                    setDraft({
+                                      ...draft,
+                                      perBand: {
+                                        ...draft.perBand,
+                                        [bss.band!]: {
+                                          ...draft.perBand[bss.band!],
+                                          ssid: e.target.value,
+                                        },
+                                      },
+                                    })
+                                  }
+                                />
+                              </FormRow>
+                              <FormRow label='Password'>
+                                <input
+                                  type='text'
+                                  placeholder='required'
+                                  className={monoInputClass}
+                                  value={draft.perBand[bss.band]?.password ?? ""}
+                                  disabled={saving}
+                                  onChange={(e) =>
+                                    setDraft({
+                                      ...draft,
+                                      perBand: {
+                                        ...draft.perBand,
+                                        [bss.band!]: {
+                                          ...draft.perBand[bss.band!],
+                                          password: e.target.value,
+                                        },
+                                      },
+                                    })
+                                  }
+                                />
+                              </FormRow>
+                            </div>
+                          ),
+                      )
+                    )}
+
+                    {/* Security type and per-band disable, independent of the
+                    split-name choice above -- the schema carries both on each
+                    BasicServiceSet regardless of whether its name is shared. */}
+                    {bands.map(
+                      (bss) =>
+                        bss.band && (
+                          <div key={`sec-${bss.band}`} className='flex items-center gap-2'>
+                            <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>
+                              {BAND_LABEL[bss.band] ?? bss.band}
+                            </span>
+                            <Select
+                              value={draft.perBand[bss.band]?.security ?? "wpa2"}
+                              disabled={saving}
+                              onValueChange={(security) =>
+                                setDraft({
+                                  ...draft,
+                                  perBand: {
+                                    ...draft.perBand,
+                                    [bss.band!]: {
+                                      ...draft.perBand[bss.band!],
+                                      security: security as WifiSecurityType,
+                                    },
+                                  },
+                                })
+                              }
+                            >
+                              <SelectTrigger className={triggerClass} style={{ width: 150 }}>
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent className={selectContentClass}>
+                                {SECURITY_OPTIONS.map((opt) => (
+                                  <SelectItem key={opt} value={opt} className={selectItemClass}>
+                                    {SECURITY_LABEL[opt]}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <label className='flex items-center gap-1.5 text-[12px] text-muted-foreground'>
+                              <Switch
+                                checked={Boolean(draft.perBand[bss.band]?.disable)}
+                                disabled={saving}
+                                onCheckedChange={(disable) =>
+                                  setDraft({
+                                    ...draft,
+                                    perBand: {
+                                      ...draft.perBand,
+                                      [bss.band!]: { ...draft.perBand[bss.band!], disable },
+                                    },
+                                  })
+                                }
+                              />
+                              Off
+                            </label>
+                          </div>
+                        ),
+                    )}
+
+                    <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
+                      <Switch
+                        checked={draft.hidden}
+                        disabled={saving}
+                        onCheckedChange={(hidden) => setDraft({ ...draft, hidden })}
+                      />
+                      Hide this network
+                    </label>
+
+                    <FormRow label='Mode'>
+                      <Select
+                        value={draft.mode}
+                        disabled={saving}
+                        onValueChange={(mode) => setDraft({ ...draft, mode: mode as NetworkMode })}
+                      >
+                        <SelectTrigger className={triggerClass} style={{ width: 140 }}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent className={selectContentClass}>
+                          {(["default", "guest", "auto"] as const).map((mode) => (
+                            <SelectItem key={mode} value={mode} className={selectItemClass}>
+                              {MODE_LABEL[mode]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </FormRow>
+
+                    <FormRow label='Subnet'>
+                      <Select
+                        value={draft.ipv4}
+                        disabled={saving}
+                        onValueChange={(ipv4) => setDraft({ ...draft, ipv4 })}
+                      >
+                        <SelectTrigger className={triggerClass} style={{ width: 160 }}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent className={selectContentClass}>
+                          {SUBNET_OPTIONS.map((subnet) => (
+                            <SelectItem
+                              key={subnet}
+                              value={subnet}
+                              className={selectItemClass}
+                              disabled={usedSubnets.has(subnet) && subnet !== network.ipv4}
+                            >
+                              {subnet}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </FormRow>
+
+                    <button
+                      className={`${actionButton("subtle")} w-fit`}
+                      onClick={() => setDraft({ ...draft, advancedOpen: !draft.advancedOpen })}
+                    >
+                      {draft.advancedOpen ? "Hide advanced" : "Advanced (not in the official app)"}
+                    </button>
+                    {draft.advancedOpen && (
+                      <div className='flex flex-col gap-2 border-l-2 border-hairline pl-2.5'>
+                        <FormRow label='DHCP start'>
+                          <input
+                            type='number'
+                            className={narrowInputClass}
+                            value={draft.dhcpv4Start}
+                            disabled={saving}
+                            onChange={(e) => setDraft({ ...draft, dhcpv4Start: e.target.value })}
+                          />
+                        </FormRow>
+                        <FormRow label='DHCP end'>
+                          <input
+                            type='number'
+                            className={narrowInputClass}
+                            value={draft.dhcpv4End}
+                            disabled={saving}
+                            onChange={(e) => setDraft({ ...draft, dhcpv4End: e.target.value })}
+                          />
+                        </FormRow>
+                        <FormRow label='Lease (s)'>
+                          <input
+                            type='number'
+                            className={narrowInputClass}
+                            value={draft.dhcpv4LeaseDurationS}
+                            disabled={saving}
+                            onChange={(e) =>
+                              setDraft({ ...draft, dhcpv4LeaseDurationS: e.target.value })
+                            }
+                          />
+                        </FormRow>
+                        <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
+                          <Switch
+                            checked={draft.dhcpDisabled}
+                            disabled={saving}
+                            onCheckedChange={(v) => setDraft({ ...draft, dhcpDisabled: v })}
+                          />
+                          Disable DHCP on this network
+                        </label>
+                        <label className='flex items-center gap-2 text-[12px] text-muted-foreground'>
+                          <Switch
+                            checked={draft.dnsDisabled}
+                            disabled={saving}
+                            onCheckedChange={(v) => setDraft({ ...draft, dnsDisabled: v })}
+                          />
+                          Disable DNS on this network
+                        </label>
+                        <div className='flex flex-col gap-1'>
+                          <span className='text-[12px] text-muted-foreground'>
+                            Static DNS — one per line, domain(s)=address(es)
+                          </span>
+                          <textarea
+                            className={textareaClass}
+                            placeholder='myserver.local=192.168.1.50'
+                            rows={2}
+                            value={draft.dnsStaticEntriesText}
+                            disabled={saving}
+                            onChange={(e) =>
+                              setDraft({ ...draft, dnsStaticEntriesText: e.target.value })
+                            }
+                          />
+                        </div>
+                        <div className='flex flex-col gap-1'>
+                          <span className='text-[12px] text-muted-foreground'>
+                            DNS forwarding — one per line, domain(s)=server(s)
+                          </span>
+                          <textarea
+                            className={textareaClass}
+                            placeholder='corp.example=10.0.0.1'
+                            rows={2}
+                            value={draft.dnsForwardRulesText}
+                            disabled={saving}
+                            onChange={(e) =>
+                              setDraft({ ...draft, dnsForwardRulesText: e.target.value })
+                            }
+                          />
+                        </div>
+                        <div className='flex flex-col gap-1'>
+                          <span className='text-[12px] text-muted-foreground'>
+                            Static routes — one per line, subnet=gateway
+                          </span>
+                          <textarea
+                            className={textareaClass}
+                            placeholder='10.10.0.0/24=192.168.1.5'
+                            rows={2}
+                            value={draft.staticRoutesText}
+                            disabled={saving}
+                            onChange={(e) =>
+                              setDraft({ ...draft, staticRoutesText: e.target.value })
+                            }
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    <div className='flex items-center gap-2'>
+                      <button
+                        className={actionButton("subtle")}
+                        disabled={saving}
+                        onClick={() => void saveNetwork(network)}
+                      >
+                        {saving ? "Saving…" : "Save"}
+                      </button>
+                      <button
+                        className={actionButton("subtle")}
+                        disabled={saving}
+                        onClick={() => setEditingDomain(null)}
+                      >
+                        Cancel
+                      </button>
+                      {!isFirst && deletingDomain !== network.domain && (
+                        <button
+                          className={actionButton("danger")}
+                          disabled={saving}
+                          onClick={() => setDeletingDomain(network.domain ?? null)}
+                        >
+                          Delete network
+                        </button>
+                      )}
+                    </div>
+
+                    {deletingDomain === network.domain && (
+                      <DeleteNetworkConfirm
+                        domain={network.domain!}
+                        onCancel={() => setDeletingDomain(null)}
+                        onDeleted={() => {
+                          setDeletingDomain(null);
+                          setEditingDomain(null);
+                        }}
+                      />
+                    )}
+                  </div>
                 )}
               </div>
-            )}
-          </div>
-        );
-      })}
-
-      {cloudConnected && !addOpen && (
-        <SettingRow title='Add a network' caption='Broadcasts on both 2.4GHz and 5GHz to start'>
-          <button className={actionButton("subtle")} onClick={() => setAddOpen(true)}>
-            Add
-          </button>
-        </SettingRow>
-      )}
-      {addOpen && (
-        <div className='mb-2.5 flex flex-col gap-2.5 rounded-md border border-hairline bg-[color-mix(in_srgb,var(--ink)_4%,var(--surface))] p-3'>
-          <FormRow label='Name'>
-            <input
-              type='text'
-              className={textInputClass}
-              value={addSsid}
-              disabled={addSaving}
-              onChange={(e) => setAddSsid(e.target.value)}
-            />
-          </FormRow>
-          <FormRow label='Password'>
-            <input
-              type='text'
-              className={monoInputClass}
-              value={addPassword}
-              disabled={addSaving}
-              onChange={(e) => setAddPassword(e.target.value)}
-            />
-          </FormRow>
-          <FormRow label='Mode'>
-            <Select
-              value={addMode}
-              disabled={addSaving}
-              onValueChange={(v) => setAddMode(v as NetworkMode)}
-            >
-              <SelectTrigger className={triggerClass} style={{ width: 140 }}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent className={selectContentClass}>
-                {(["default", "guest", "auto"] as const).map((mode) => (
-                  <SelectItem key={mode} value={mode} className={selectItemClass}>
-                    {MODE_LABEL[mode]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </FormRow>
-          <FormRow label='Subnet'>
-            <Select value={addIpv4} disabled={addSaving} onValueChange={setAddIpv4}>
-              <SelectTrigger className={triggerClass} style={{ width: 160 }}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent className={selectContentClass}>
-                {SUBNET_OPTIONS.map((subnet) => (
-                  <SelectItem
-                    key={subnet}
-                    value={subnet}
-                    className={selectItemClass}
-                    disabled={usedSubnets.has(subnet)}
-                  >
-                    {subnet}
-                    {usedSubnets.has(subnet) ? " (in use)" : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </FormRow>
-          {availableSubnets.length === 0 && (
-            <Callout tone='error'>Every predefined subnet is already in use.</Callout>
-          )}
-          {addResult && <div className='text-[12px] text-muted-foreground'>{addResult}</div>}
-          <div className='flex items-center gap-2'>
-            <button
-              className={actionButton("subtle")}
-              disabled={addSaving || availableSubnets.length === 0}
-              onClick={() => void createNetwork()}
-            >
-              {addSaving ? "Creating…" : "Create"}
-            </button>
-            <button
-              className={actionButton("subtle")}
-              disabled={addSaving}
-              onClick={() => setAddOpen(false)}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {meshNodes.length > 0 && (
-        <>
-          <SectionLabel>Mesh nodes</SectionLabel>
-          {meshNodes.map(([deviceId, node]) => {
-            const trusted = node.auth === "MESH_AUTH_TRUSTED";
-            return (
-              <SettingRow
-                key={deviceId}
-                title={node.displayName ?? "Mesh node"}
-                caption={node.hardwareVersion ? `hardware ${node.hardwareVersion}` : undefined}
-                note={meshResult?.id === deviceId ? meshResult.message : null}
-              >
-                <Badge tone={!trusted ? "critical" : "neutral"}>
-                  {trusted ? "trusted" : (node.auth ?? "unknown")}
-                </Badge>
-                {cloudConnected && (
-                  <button
-                    className={actionButton("subtle")}
-                    disabled={meshBusyId === deviceId}
-                    onClick={() => void toggleMeshTrust(deviceId, !trusted)}
-                  >
-                    {meshBusyId === deviceId ? "Saving…" : trusted ? "Untrust" : "Trust"}
-                  </button>
-                )}
-              </SettingRow>
             );
           })}
-        </>
-      )}
 
-      {wifiConfig.boot?.evenSideSoftwareVersion && (
-        <SettingRow title='Router firmware' caption={`country ${wifiConfig.countryCode ?? "—"}`}>
-          <span className='font-mono text-[12px] text-muted-foreground tabular-nums'>
-            {wifiConfig.boot.evenSideSoftwareVersion}
-          </span>
-        </SettingRow>
+          {cloudConnected && !addOpen && (
+            <SettingRow title='Add a network' caption='Broadcasts on both 2.4GHz and 5GHz to start'>
+              <button className={actionButton("subtle")} onClick={() => setAddOpen(true)}>
+                Add
+              </button>
+            </SettingRow>
+          )}
+          {addOpen && (
+            <div className='mb-2.5 flex flex-col gap-2.5 rounded-md border border-hairline bg-[color-mix(in_srgb,var(--ink)_4%,var(--surface))] p-3'>
+              <FormRow label='Name'>
+                <input
+                  type='text'
+                  className={textInputClass}
+                  value={addSsid}
+                  disabled={addSaving}
+                  onChange={(e) => setAddSsid(e.target.value)}
+                />
+              </FormRow>
+              <FormRow label='Password'>
+                <input
+                  type='text'
+                  className={monoInputClass}
+                  value={addPassword}
+                  disabled={addSaving}
+                  onChange={(e) => setAddPassword(e.target.value)}
+                />
+              </FormRow>
+              <FormRow label='Mode'>
+                <Select
+                  value={addMode}
+                  disabled={addSaving}
+                  onValueChange={(v) => setAddMode(v as NetworkMode)}
+                >
+                  <SelectTrigger className={triggerClass} style={{ width: 140 }}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className={selectContentClass}>
+                    {(["default", "guest", "auto"] as const).map((mode) => (
+                      <SelectItem key={mode} value={mode} className={selectItemClass}>
+                        {MODE_LABEL[mode]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormRow>
+              <FormRow label='Subnet'>
+                <Select value={addIpv4} disabled={addSaving} onValueChange={setAddIpv4}>
+                  <SelectTrigger className={triggerClass} style={{ width: 160 }}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className={selectContentClass}>
+                    {SUBNET_OPTIONS.map((subnet) => (
+                      <SelectItem
+                        key={subnet}
+                        value={subnet}
+                        className={selectItemClass}
+                        disabled={usedSubnets.has(subnet)}
+                      >
+                        {subnet}
+                        {usedSubnets.has(subnet) ? " (in use)" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormRow>
+              {availableSubnets.length === 0 && (
+                <Callout tone='error'>Every predefined subnet is already in use.</Callout>
+              )}
+              {addResult && <div className='text-[12px] text-muted-foreground'>{addResult}</div>}
+              <div className='flex items-center gap-2'>
+                <button
+                  className={actionButton("subtle")}
+                  disabled={addSaving || availableSubnets.length === 0}
+                  onClick={() => void createNetwork()}
+                >
+                  {addSaving ? "Creating…" : "Create"}
+                </button>
+                <button
+                  className={actionButton("subtle")}
+                  disabled={addSaving}
+                  onClick={() => setAddOpen(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {meshNodes.length > 0 && (
+            <>
+              <SectionLabel>Mesh nodes</SectionLabel>
+              {meshNodes.map(([deviceId, node]) => {
+                const trusted = node.auth === "MESH_AUTH_TRUSTED";
+                return (
+                  <SettingRow
+                    key={deviceId}
+                    title={node.displayName ?? "Mesh node"}
+                    caption={node.hardwareVersion ? `hardware ${node.hardwareVersion}` : undefined}
+                    note={meshResult?.id === deviceId ? meshResult.message : null}
+                  >
+                    <Badge tone={!trusted ? "critical" : "neutral"}>
+                      {trusted ? "trusted" : (node.auth ?? "unknown")}
+                    </Badge>
+                    {cloudConnected && (
+                      <button
+                        className={actionButton("subtle")}
+                        disabled={meshBusyId === deviceId}
+                        onClick={() => void toggleMeshTrust(deviceId, !trusted)}
+                      >
+                        {meshBusyId === deviceId ? "Saving…" : trusted ? "Untrust" : "Trust"}
+                      </button>
+                    )}
+                  </SettingRow>
+                );
+              })}
+            </>
+          )}
+
+          {wifiConfig.boot?.evenSideSoftwareVersion && (
+            <SettingRow
+              title='Router firmware'
+              caption={`country ${wifiConfig.countryCode ?? "—"}`}
+            >
+              <span className='font-mono text-[12px] text-muted-foreground tabular-nums'>
+                {wifiConfig.boot.evenSideSoftwareVersion}
+              </span>
+            </SettingRow>
+          )}
+        </>
       )}
 
       <SectionLabel>Maintenance</SectionLabel>
       <DangerAction
         title='Reboot router'
-        caption='WiFi drops for a minute or two; the dish stays up'
+        caption={
+          answering
+            ? "WiFi drops for a minute or two; the dish stays up"
+            : "Unavailable until the router answers"
+        }
         buttonLabel='Reboot'
         confirmLabel='Yes, reboot router'
+        disabled={!answering}
         onRun={async () => {
           const routerClient = await DishClient.load("router");
           await routerClient.reboot();
@@ -1003,295 +1013,272 @@ export function RouterSettingsTab({
         }}
       />
 
-      <SectionLabel>Advanced</SectionLabel>
-      <Callout tone={cloudConnected ? "info" : "error"} className='mb-1'>
-        {cloudConnected
-          ? "These write through your connected Starlink account's cloud session, not the local network -- every local write RPC on this router is confirmed blocked on current firmware (Permission denied)."
-          : "Confirmed blocked on current firmware (Permission denied on every local write RPC). Connect your Starlink account in the App tab to write these through the cloud instead."}
-      </Callout>
-
-      <DangerToggle
-        title='Bypass mode'
-        caption="Disables this router's own WiFi for a third-party router on its ethernet port"
-        checked={Boolean(wifiConfig.bypassMode)}
+      {showDns && (
+        <>
+          <SectionLabel>DNS</SectionLabel>
+          <CustomDnsSection
+            nameservers={wifiConfig?.nameservers ?? []}
+            disabled={!cloudConnected}
+            onSave={async (nameservers) => {
+              await applyRouterConfigUpdate({ kind: "customDns", nameservers });
+              onConfigChanged();
+            }}
+          />
+        </>
+      )}
+      <SectionLabel>Bypass</SectionLabel>
+      <BypassSection
+        reported={bypassed}
+        routerAnswering={answering}
         disabled={!cloudConnected}
-        dangerousWhen={true}
-        warning="This will disconnect this router's own WiFi immediately, including whatever you're using to reach it right now. There's no local undo -- recovery needs a factory reset from the Starlink app itself. Only continue if a third-party router is already wired in and ready to take over."
-        confirmLabel='Yes, enable bypass mode'
-        onConfirm={async (enabled) => {
-          await setRouterBypassMode(enabled);
-          return enabled ? "Enabled — this router's WiFi will drop shortly." : "Disabled.";
+        onReload={cloudAccount.reload}
+        onSave={async (enabled) => {
+          await applyRouterConfigUpdate({ kind: "bypass", enabled });
         }}
       />
 
-      <SettingRow
-        title='Custom DNS'
-        caption={
-          cloudConnected
-            ? "Comma-separated resolvers; empty clears it. Overridden while content filtering below is on."
-            : wifiConfig.nameservers?.length
-              ? wifiConfig.nameservers.join(", ")
-              : "Using Starlink's default resolvers — connect your account above to change this"
-        }
-        note={dnsResult}
-      >
-        {cloudConnected ? (
-          <>
-            <input
-              type='text'
-              placeholder='1.1.1.1, 8.8.8.8'
-              className='h-7 w-56 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink hover:border-input'
-              value={dnsDraft}
-              disabled={dnsSaving}
-              onChange={(event) => setDnsDraft(event.target.value)}
-            />
-            <button
-              className={actionButton("subtle")}
-              disabled={dnsSaving}
-              onClick={() => void saveDns()}
-            >
-              {dnsSaving ? "Saving…" : "Save"}
-            </button>
-          </>
-        ) : (
-          <Switch
-            checked={
-              Boolean(wifiConfig.nameservers?.length) && wifiConfig.customDnsDisabled !== true
-            }
-            disabled
-          />
-        )}
-      </SettingRow>
+      {answering && wifiConfig && (
+        <>
+          <SectionLabel>Advanced</SectionLabel>
+          <Callout tone='info' className='mb-1'>
+            These write through your connected Starlink account's cloud session, not the local
+            network -- every local write RPC on this router is confirmed blocked on current firmware
+            (Permission denied).
+          </Callout>
 
-      <SettingRow
-        title='Content filtering'
-        caption='Applies to every network on this router. Overrides custom DNS above while enabled.'
-        note={filteringResult}
-      >
-        {cloudConnected ? (
-          <Select
-            value={String(filteringLevel)}
-            disabled={filteringSaving}
-            onValueChange={(value) => void saveFiltering(Number(value) as 0 | 1 | 2)}
+          <SettingRow
+            title='Content filtering'
+            caption='Applies to every network on this router. Overrides custom DNS above while enabled.'
+            note={filteringResult}
           >
-            <SelectTrigger className={triggerClass} style={{ width: 200 }}>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className={selectContentClass}>
-              {([0, 1, 2] as const).map((level) => (
-                <SelectItem key={level} value={String(level)} className={selectItemClass}>
-                  {FILTERING_LABEL[level]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        ) : (
-          <Badge>{FILTERING_LABEL[filteringLevel]}</Badge>
-        )}
-      </SettingRow>
-      {cloudConnected && filteringLevel > 0 && (
-        <div className='mb-2.5 flex items-center gap-2 pl-0.5'>
-          <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>Allow list</span>
-          <input
-            type='text'
-            placeholder='example.com, another.com'
-            className='h-7 flex-1 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink hover:border-input'
-            value={allowDomainsDraft}
-            disabled={filteringSaving}
-            onChange={(e) => setAllowDomainsDraft(e.target.value)}
-          />
-          <button
-            className={actionButton("subtle")}
-            disabled={filteringSaving}
-            onClick={() =>
-              void saveFiltering(
-                filteringLevel,
-                allowDomainsDraft
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean),
-              )
-            }
-          >
-            Save
-          </button>
-        </div>
-      )}
-      <SettingRow
-        title='Fail open'
-        caption='If content filtering itself becomes unreachable, keep internet working unfiltered rather than blocking it entirely'
-        note={radioNoteFor("failOpen")}
-      >
-        <Switch
-          checked={!wifiConfig.disableSandboxFailOpen}
-          disabled={radioDisabled}
-          onCheckedChange={(failOpen) =>
-            saveRadio("failOpen", { disableSandboxFailOpen: !failOpen })
-          }
-        />
-      </SettingRow>
-
-      <SectionLabel>Radio</SectionLabel>
-      {(
-        [
-          ["2.4GHz", "2ghz"],
-          ["5GHz", "5ghz"],
-          ["5GHz high", "5ghzHigh"],
-        ] as const
-      ).map(([label, suffix]) => {
-        const disableField = `disable${suffix[0].toUpperCase()}${suffix.slice(1)}` as
-          "disable2ghz" | "disable5ghz" | "disable5ghzHigh";
-        const txField = `txPowerLevel${suffix[0].toUpperCase()}${suffix.slice(1)}` as
-          "txPowerLevel2ghz" | "txPowerLevel5ghz" | "txPowerLevel5ghzHigh";
-        const channelField = `channel${suffix[0].toUpperCase()}${suffix.slice(1)}` as
-          "channel2ghz" | "channel5ghz" | "channel5ghzHigh";
-        const modeField = `wirelessMode${suffix[0].toUpperCase()}${suffix.slice(1)}` as
-          "wirelessMode2ghz" | "wirelessMode5ghz" | "wirelessMode5ghzHigh";
-        const htField = `htBandwidth${suffix[0].toUpperCase()}${suffix.slice(1)}` as
-          "htBandwidth2ghz" | "htBandwidth5ghz" | "htBandwidth5ghzHigh";
-        return (
-          <div key={suffix} className='mb-2 flex flex-col gap-1.5'>
-            <span className='font-mono text-[10px] font-medium tracking-[0.08em] text-muted-foreground uppercase'>
-              {label}
-            </span>
-            <SettingRow title='Enabled' note={radioNoteFor(disableField)}>
-              <Switch
-                checked={!wifiConfig[disableField]}
-                disabled={radioDisabled}
-                onCheckedChange={(enabled) => saveRadio(disableField, { [disableField]: !enabled })}
-              />
-            </SettingRow>
-            <SettingRow title='Transmit power' note={radioNoteFor(txField)}>
+            {cloudConnected ? (
               <Select
-                value={(wifiConfig[txField] as string | undefined) ?? "TX_POWER_LEVEL_100"}
-                disabled={radioDisabled}
-                onValueChange={(v) => saveRadio(txField, { [txField]: v as TxPowerLevel })}
+                value={String(filteringLevel)}
+                disabled={filteringSaving}
+                onValueChange={(value) => void saveFiltering(Number(value) as 0 | 1 | 2)}
               >
-                <SelectTrigger className={triggerClass} style={{ width: 90 }}>
+                <SelectTrigger className={triggerClass} style={{ width: 200 }}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className={selectContentClass}>
-                  {TX_POWER_OPTIONS.map((opt) => (
-                    <SelectItem key={opt} value={opt} className={selectItemClass}>
-                      {TX_POWER_LABEL[opt]}
+                  {([0, 1, 2] as const).map((level) => (
+                    <SelectItem key={level} value={String(level)} className={selectItemClass}>
+                      {FILTERING_LABEL[level]}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
-            </SettingRow>
-            <SettingRow
-              title='Channel'
-              caption='0 or blank = Auto'
-              note={radioNoteFor(channelField)}
-            >
-              <input
-                type='number'
-                className={narrowInputClass}
-                value={channelValue(channelField)}
-                disabled={radioDisabled}
-                onChange={(e) =>
-                  setChannelDrafts({ ...channelDrafts, [channelField]: e.target.value })
-                }
-                onBlur={(e) => {
-                  const n = Number(e.target.value);
-                  if (Number.isInteger(n) && n >= 0 && n <= 200)
-                    saveRadio(channelField, { [channelField]: n });
-                }}
-              />
-            </SettingRow>
-            <SettingRow title='Compatibility mode' note={radioNoteFor(modeField)}>
-              <Select
-                value={(wifiConfig[modeField] as string | undefined) ?? "WIRELESS_MODE_DEFAULT"}
-                disabled={radioDisabled}
-                onValueChange={(v) => saveRadio(modeField, { [modeField]: v as WirelessMode })}
-              >
-                <SelectTrigger className={triggerClass} style={{ width: 170 }}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className={selectContentClass}>
-                  {WIRELESS_MODE_OPTIONS.map((opt) => (
-                    <SelectItem key={opt} value={opt} className={selectItemClass}>
-                      {WIRELESS_MODE_LABEL[opt]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </SettingRow>
-            <SettingRow title='Channel width' note={radioNoteFor(htField)}>
-              <Select
-                value={(wifiConfig[htField] as string | undefined) ?? "HT_BANDWIDTH_DEFAULT"}
-                disabled={radioDisabled}
-                onValueChange={(v) => saveRadio(htField, { [htField]: v as HtBandwidth })}
-              >
-                <SelectTrigger className={triggerClass} style={{ width: 110 }}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className={selectContentClass}>
-                  {HT_BANDWIDTH_OPTIONS.map((opt) => (
-                    <SelectItem key={opt} value={opt} className={selectItemClass}>
-                      {HT_BANDWIDTH_LABEL[opt]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </SettingRow>
-            {suffix !== "2ghz" && (
-              <SettingRow title='VHT width (802.11ac)' note={radioNoteFor(`vht${suffix}`)}>
-                <Select
-                  value={
-                    ((suffix === "5ghz"
-                      ? wifiConfig.vhtBandwidth
-                      : wifiConfig.vhtBandwidth5ghzHigh) as string | undefined) ??
-                    "VHT_BANDWIDTH_DEFAULT"
-                  }
-                  disabled={radioDisabled}
-                  onValueChange={(v) =>
-                    saveRadio(
-                      `vht${suffix}`,
-                      suffix === "5ghz"
-                        ? { vhtBandwidth: v as VhtBandwidth }
-                        : { vhtBandwidth5ghzHigh: v as VhtBandwidth },
-                    )
-                  }
-                >
-                  <SelectTrigger className={triggerClass} style={{ width: 110 }}>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className={selectContentClass}>
-                    {VHT_BANDWIDTH_OPTIONS.map((opt) => (
-                      <SelectItem key={opt} value={opt} className={selectItemClass}>
-                        {VHT_BANDWIDTH_LABEL[opt]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </SettingRow>
+            ) : (
+              <Badge>{FILTERING_LABEL[filteringLevel]}</Badge>
             )}
-          </div>
-        );
-      })}
-      <SettingRow
-        title='Band steering'
-        caption='Push dual-band devices onto 5GHz automatically'
-        note={radioNoteFor("bandSteering")}
-      >
-        <Switch
-          checked={!wifiConfig.disableBandSteering}
-          disabled={radioDisabled}
-          onCheckedChange={(enabled) =>
-            saveRadio("bandSteering", { disableBandSteering: !enabled })
-          }
-        />
-      </SettingRow>
-      <SettingRow title='Allow new mesh nodes to pair' note={radioNoteFor("meshOnboarding")}>
-        <Switch
-          checked={!wifiConfig.disableMeshOnboarding}
-          disabled={radioDisabled}
-          onCheckedChange={(enabled) =>
-            saveRadio("meshOnboarding", { disableMeshOnboarding: !enabled })
-          }
-        />
-      </SettingRow>
+          </SettingRow>
+          {cloudConnected && filteringLevel > 0 && (
+            <div className='mb-2.5 flex items-center gap-2 pl-0.5'>
+              <span className='w-16 shrink-0 text-[12px] text-muted-foreground'>Allow list</span>
+              <input
+                type='text'
+                placeholder='example.com, another.com'
+                className='h-7 flex-1 rounded-sm border border-hairline bg-transparent px-2 font-mono text-[12px] text-ink hover:border-input'
+                value={allowDomainsDraft}
+                disabled={filteringSaving}
+                onChange={(e) => setAllowDomainsDraft(e.target.value)}
+              />
+              <button
+                className={actionButton("subtle")}
+                disabled={filteringSaving}
+                onClick={() =>
+                  void saveFiltering(
+                    filteringLevel,
+                    allowDomainsDraft
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+                  )
+                }
+              >
+                Save
+              </button>
+            </div>
+          )}
+          <SettingRow
+            title='Fail open'
+            caption='If content filtering itself becomes unreachable, keep internet working unfiltered rather than blocking it entirely'
+            note={radioNoteFor("failOpen")}
+          >
+            <Switch
+              checked={!wifiConfig.disableSandboxFailOpen}
+              disabled={radioDisabled}
+              onCheckedChange={(failOpen) =>
+                saveRadio("failOpen", { disableSandboxFailOpen: !failOpen })
+              }
+            />
+          </SettingRow>
+
+          <SectionLabel>Radio</SectionLabel>
+          {(
+            [
+              ["2.4GHz", "2ghz"],
+              ["5GHz", "5ghz"],
+              ["5GHz high", "5ghzHigh"],
+            ] as const
+          ).map(([label, suffix]) => {
+            const disableField = `disable${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+              "disable2ghz" | "disable5ghz" | "disable5ghzHigh";
+            const txField = `txPowerLevel${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+              "txPowerLevel2ghz" | "txPowerLevel5ghz" | "txPowerLevel5ghzHigh";
+            const channelField = `channel${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+              "channel2ghz" | "channel5ghz" | "channel5ghzHigh";
+            const modeField = `wirelessMode${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+              "wirelessMode2ghz" | "wirelessMode5ghz" | "wirelessMode5ghzHigh";
+            const htField = `htBandwidth${suffix[0].toUpperCase()}${suffix.slice(1)}` as
+              "htBandwidth2ghz" | "htBandwidth5ghz" | "htBandwidth5ghzHigh";
+            return (
+              <div key={suffix} className='mb-2 flex flex-col gap-1.5'>
+                <span className='font-mono text-[10px] font-medium tracking-[0.08em] text-muted-foreground uppercase'>
+                  {label}
+                </span>
+                <SettingRow title='Enabled' note={radioNoteFor(disableField)}>
+                  <Switch
+                    checked={!wifiConfig[disableField]}
+                    disabled={radioDisabled}
+                    onCheckedChange={(enabled) =>
+                      saveRadio(disableField, { [disableField]: !enabled })
+                    }
+                  />
+                </SettingRow>
+                <SettingRow title='Transmit power' note={radioNoteFor(txField)}>
+                  <Select
+                    value={(wifiConfig[txField] as string | undefined) ?? "TX_POWER_LEVEL_100"}
+                    disabled={radioDisabled}
+                    onValueChange={(v) => saveRadio(txField, { [txField]: v as TxPowerLevel })}
+                  >
+                    <SelectTrigger className={triggerClass} style={{ width: 90 }}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className={selectContentClass}>
+                      {TX_POWER_OPTIONS.map((opt) => (
+                        <SelectItem key={opt} value={opt} className={selectItemClass}>
+                          {TX_POWER_LABEL[opt]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </SettingRow>
+                <SettingRow
+                  title='Channel'
+                  caption='0 or blank = Auto'
+                  note={radioNoteFor(channelField)}
+                >
+                  <input
+                    type='number'
+                    className={narrowInputClass}
+                    value={channelValue(channelField)}
+                    disabled={radioDisabled}
+                    onChange={(e) =>
+                      setChannelDrafts({ ...channelDrafts, [channelField]: e.target.value })
+                    }
+                    onBlur={(e) => {
+                      const n = Number(e.target.value);
+                      if (Number.isInteger(n) && n >= 0 && n <= 200)
+                        saveRadio(channelField, { [channelField]: n });
+                    }}
+                  />
+                </SettingRow>
+                <SettingRow title='Compatibility mode' note={radioNoteFor(modeField)}>
+                  <Select
+                    value={(wifiConfig[modeField] as string | undefined) ?? "WIRELESS_MODE_DEFAULT"}
+                    disabled={radioDisabled}
+                    onValueChange={(v) => saveRadio(modeField, { [modeField]: v as WirelessMode })}
+                  >
+                    <SelectTrigger className={triggerClass} style={{ width: 170 }}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className={selectContentClass}>
+                      {WIRELESS_MODE_OPTIONS.map((opt) => (
+                        <SelectItem key={opt} value={opt} className={selectItemClass}>
+                          {WIRELESS_MODE_LABEL[opt]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </SettingRow>
+                <SettingRow title='Channel width' note={radioNoteFor(htField)}>
+                  <Select
+                    value={(wifiConfig[htField] as string | undefined) ?? "HT_BANDWIDTH_DEFAULT"}
+                    disabled={radioDisabled}
+                    onValueChange={(v) => saveRadio(htField, { [htField]: v as HtBandwidth })}
+                  >
+                    <SelectTrigger className={triggerClass} style={{ width: 110 }}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className={selectContentClass}>
+                      {HT_BANDWIDTH_OPTIONS.map((opt) => (
+                        <SelectItem key={opt} value={opt} className={selectItemClass}>
+                          {HT_BANDWIDTH_LABEL[opt]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </SettingRow>
+                {suffix !== "2ghz" && (
+                  <SettingRow title='VHT width (802.11ac)' note={radioNoteFor(`vht${suffix}`)}>
+                    <Select
+                      value={
+                        ((suffix === "5ghz"
+                          ? wifiConfig.vhtBandwidth
+                          : wifiConfig.vhtBandwidth5ghzHigh) as string | undefined) ??
+                        "VHT_BANDWIDTH_DEFAULT"
+                      }
+                      disabled={radioDisabled}
+                      onValueChange={(v) =>
+                        saveRadio(
+                          `vht${suffix}`,
+                          suffix === "5ghz"
+                            ? { vhtBandwidth: v as VhtBandwidth }
+                            : { vhtBandwidth5ghzHigh: v as VhtBandwidth },
+                        )
+                      }
+                    >
+                      <SelectTrigger className={triggerClass} style={{ width: 110 }}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className={selectContentClass}>
+                        {VHT_BANDWIDTH_OPTIONS.map((opt) => (
+                          <SelectItem key={opt} value={opt} className={selectItemClass}>
+                            {VHT_BANDWIDTH_LABEL[opt]}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </SettingRow>
+                )}
+              </div>
+            );
+          })}
+          <SettingRow
+            title='Band steering'
+            caption='Push dual-band devices onto 5GHz automatically'
+            note={radioNoteFor("bandSteering")}
+          >
+            <Switch
+              checked={!wifiConfig.disableBandSteering}
+              disabled={radioDisabled}
+              onCheckedChange={(enabled) =>
+                saveRadio("bandSteering", { disableBandSteering: !enabled })
+              }
+            />
+          </SettingRow>
+          <SettingRow title='Allow new mesh nodes to pair' note={radioNoteFor("meshOnboarding")}>
+            <Switch
+              checked={!wifiConfig.disableMeshOnboarding}
+              disabled={radioDisabled}
+              onCheckedChange={(enabled) =>
+                saveRadio("meshOnboarding", { disableMeshOnboarding: !enabled })
+              }
+            />
+          </SettingRow>
+        </>
+      )}
     </>
   );
 }
@@ -1314,9 +1301,8 @@ function FormRow({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
-/** Its own armed-confirm, separate from DangerToggle (which is for a
- *  persistent switch, not a fire-once removal) -- deleting a network drops
- *  whatever is connected to it immediately. */
+/** Its own armed-confirm, for a fire-once removal rather than a persistent
+ *  switch -- deleting a network drops whatever is connected to it immediately. */
 function DeleteNetworkConfirm({
   domain,
   onCancel,
