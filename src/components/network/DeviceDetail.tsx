@@ -25,7 +25,6 @@ import {
 } from "../../lib/routerClientUpdate";
 import { AccountRequiredNotice } from "../shared/AccountRequiredNotice";
 import { useCloudAccount } from "../../hooks/useCloudAccount";
-import { supportsRouterClientPause } from "../../lib/cloudHost";
 import {
   Dialog,
   DialogContent,
@@ -82,7 +81,6 @@ export function DeviceDetail({
     isThisDevice,
     viewerIdentified,
     cloudConnected: cloudStatus === "ready",
-    hostSupportsPause: supportsRouterClientPause(),
   });
 
   useEffect(() => {
@@ -195,7 +193,7 @@ export function DeviceDetail({
       <Dialog open={confirmingPause} onOpenChange={setConfirmingPause}>
         <DialogContent
           showCloseButton={false}
-          className='gap-3 border-border/50 sm:max-w-md'
+          className='glass-panel gap-3 sm:max-w-md'
           overlayClassName='bg-black/30 backdrop-blur-[2px]'
         >
           <DialogHeader>

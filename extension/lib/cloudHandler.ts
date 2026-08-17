@@ -23,9 +23,16 @@ import { browser } from "wxt/browser";
 import { createCloudHandler } from "../../cloud/starlinkCloudHandler";
 import { DishClient } from "@core/dishClient";
 import { prepareDishUpdate, type DishUpdate } from "@core/dishConfigUpdate";
+import {
+  buildRouterConfigRequest,
+  readCurrentNetworks,
+  readCurrentSubnet,
+  type RouterConfigUpdate,
+} from "@core/routerConfigUpdate";
 import { prepareRouterClientUpdate, type RouterClientUpdate } from "@core/routerClientUpdate";
 import type { CloudReply, CloudRequest } from "@/lib/cloudHost";
-import { DISH_HANDLE_URL, ROUTER_HANDLE_URL } from "./endpoints";
+import { dishHandleUrl, routerHandleUrl } from "./endpoints";
+import { loadSelfDeviceClientId } from "./selfDevice";
 
 const SESSION_KEY = "cloudSession";
 
@@ -34,6 +41,10 @@ const SESSION_KEY = "cloudSession";
 let ourCookie: string | null = null;
 let routerPromise: Promise<DishClient> | null = null;
 let dishPromise: Promise<DishClient> | null = null;
+// A client holds the URL it was loaded with, so one cached across an address
+// change would keep dialling the box the user just told us they had moved.
+let cachedRouterUrl = "";
+let cachedDishUrl = "";
 
 const cloudHandler = createCloudHandler({
   fetch: ((input: RequestInfo | URL, init?: RequestInit) =>
@@ -48,12 +59,42 @@ const cloudHandler = createCloudHandler({
     void browser.storage.local.remove(SESSION_KEY);
   },
   prepareDeviceUpdate: async (update) => {
-    routerPromise ??= DishClient.load("router", { handleUrl: ROUTER_HANDLE_URL });
+    const routerUrl = routerHandleUrl();
+    if (routerUrl !== cachedRouterUrl) {
+      cachedRouterUrl = routerUrl;
+      routerPromise = null;
+    }
+    routerPromise ??= DishClient.load("router", { handleUrl: routerUrl });
     return prepareRouterClientUpdate(await routerPromise, update);
   },
   prepareDishUpdate: async (update) => {
-    dishPromise ??= DishClient.load("dish", { handleUrl: DISH_HANDLE_URL });
+    const dishUrl = dishHandleUrl();
+    if (dishUrl !== cachedDishUrl) {
+      cachedDishUrl = dishUrl;
+      dishPromise = null;
+    }
+    dishPromise ??= DishClient.load("dish", { handleUrl: dishUrl });
     return prepareDishUpdate(await dishPromise, update);
+  },
+  prepareRouterConfigUpdate: async (update, targetId, callGateway) => {
+    const routerUrl = routerHandleUrl();
+    if (routerUrl !== cachedRouterUrl) {
+      cachedRouterUrl = routerUrl;
+      routerPromise = null;
+    }
+    routerPromise ??= DishClient.load("router", { handleUrl: routerUrl });
+    const client = await routerPromise;
+    const networks = await readCurrentNetworks(update, client, targetId, callGateway);
+    return client.encodeRequest(buildRouterConfigRequest(targetId, update, networks));
+  },
+  readRouterSubnet: async (targetId, callGateway) => {
+    const routerUrl = routerHandleUrl();
+    if (routerUrl !== cachedRouterUrl) {
+      cachedRouterUrl = routerUrl;
+      routerPromise = null;
+    }
+    routerPromise ??= DishClient.load("router", { handleUrl: routerUrl });
+    return readCurrentSubnet(await routerPromise, targetId, callGateway);
   },
 });
 
@@ -112,14 +153,31 @@ async function setCookieRule(cookie: string | null): Promise<void> {
 export async function handleCloudRequest(request: CloudRequest): Promise<CloudReply> {
   const route = new URL(request.path, "http://extension.invalid").pathname;
 
-  // Renaming is safe from anywhere, but pausing is not: a desktop extension cannot
-  // read its host's LAN address or MAC, so it cannot tell whether the client it is
-  // about to cut off is the one it is running on. Refused here rather than left to
-  // the hidden control, so nothing that reaches this route can self-pause.
+  // A pause aimed at the device running this extension would cut off the session
+  // needed to undo it, and the only thing that knows which device that is, is the
+  // one the user named. Enforced here as well as in the control that renders it.
   if (route === "/cloud/device" && request.method === "POST") {
     const update = request.body as RouterClientUpdate;
-    if (update?.kind !== "rename")
+    if (update?.kind === "rename") return cloudHandler.updateClient(update);
+    if (update?.kind !== "pause")
       return { status: 501, body: { error: "unsupported_on_extension" } };
+    const selfClientId = await loadSelfDeviceClientId();
+    if (selfClientId === null)
+      return {
+        status: 409,
+        body: {
+          error: "self_device_unknown",
+          message: "Choose this device under Settings → App before pausing others.",
+        },
+      };
+    if (update.clientId === selfClientId)
+      return {
+        status: 409,
+        body: {
+          error: "self_pause_refused",
+          message: "This is the device you are using, so it cannot be paused from here.",
+        },
+      };
     return cloudHandler.updateClient(update);
   }
 
@@ -128,6 +186,12 @@ export async function handleCloudRequest(request: CloudRequest): Promise<CloudRe
   // whole, not to whichever device happens to be running the extension.
   if (route === "/cloud/dish-config" && request.method === "POST") {
     return cloudHandler.updateDishConfig(request.body as DishUpdate);
+  }
+
+  // Custom DNS is router-wide, not per-client, so it carries none of the
+  // self-target hazard that makes pausing unsafe on this host.
+  if (route === "/cloud/router-config" && request.method === "POST") {
+    return cloudHandler.updateRouterConfig(request.body as RouterConfigUpdate);
   }
 
   // /cloud/session is connect (capture our copy) and disconnect (drop our copy).

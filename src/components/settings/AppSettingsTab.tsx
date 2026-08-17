@@ -7,7 +7,7 @@
 // that row appears only where the desktop host actually exposes it. Presence of
 // the method is the whole gate; the host's `platform` only words the copy.
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Switch } from "@/components/ui/switch";
 import { actionButton } from "@/components/ui/action-button";
 import {
@@ -17,7 +17,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { SectionLabel, SettingRow, selectContentClass, selectItemClass, triggerClass } from "./settingsChrome";
+import {
+  SectionLabel,
+  SettingRow,
+  selectContentClass,
+  selectItemClass,
+  triggerClass,
+} from "./settingsChrome";
 import {
   readToolbarStyle,
   setToolbarStyle,
@@ -25,6 +31,9 @@ import {
   type ToolbarStyle,
 } from "../../lib/toolbarStyle";
 import { apiRequest } from "../../lib/apiHost";
+import { selfDeviceHost } from "../../lib/selfDeviceHost";
+import { displayName, isClientDevice } from "../network/networkFormat";
+import type { WifiClientJson } from "@core/dishClient";
 
 interface WebhookConfig {
   url: string;
@@ -136,7 +145,109 @@ function useMenuBarThroughput(): [boolean, (on: boolean) => void] | null {
   return [on, toggle];
 }
 
-export function AppSettingsTab() {
+const NO_SELF_DEVICE = "none";
+
+/** Names one roster entry as the device the dashboard runs on, for hosts that
+ *  cannot work it out. Pausing is withheld from whatever is named here. */
+function SelfDeviceRow({ clients }: { clients: WifiClientJson[] }) {
+  const host = selfDeviceHost();
+  const [clientId, setClientId] = useState<number | null>(null);
+  const [saveFailed, setSaveFailed] = useState(false);
+
+  useEffect(() => {
+    if (!host) return;
+    let active = true;
+    void host.read().then((stored) => {
+      if (active) setClientId(stored);
+    });
+    return () => {
+      active = false;
+    };
+  }, [host]);
+
+  const devices = useMemo(
+    () => clients.filter((client) => isClientDevice(client) && client.clientId !== undefined),
+    [clients],
+  );
+
+  if (!host) return null;
+
+  const named = devices.find((device) => device.clientId === clientId);
+  // An empty roster is the router not answering yet, not a choice gone bad.
+  const missing = clientId !== null && devices.length > 0 && !named;
+
+  // The worker reads what was stored, not what this row shows, so a write that
+  // failed has to take the row back with it.
+  const choose = async (value: string) => {
+    const previous = clientId;
+    const next = value === NO_SELF_DEVICE ? null : Number(value);
+    setClientId(next);
+    setSaveFailed(false);
+    try {
+      await host.write(next);
+    } catch {
+      setClientId(previous);
+      setSaveFailed(true);
+    }
+  };
+
+  return (
+    <SettingRow
+      title='Your device on this network'
+      info='The router lists every connected device the same way, so Dishylink cannot tell which one you are sitting at. Pick yours and it is marked "This device" in the network list, with no pause button of its own: pausing it would cut off the internet connection this dashboard needs to unpause it again, and you would have to undo it from another device or the Starlink app. Change or clear it here at any time.'
+      infoSeverity='warn'
+      caption='Pick the computer you are using right now'
+      note={
+        saveFailed
+          ? "That could not be saved, so nothing changed. Try again."
+          : clientId === null
+            ? "Until you pick one, no device can be paused."
+            : missing
+              ? "The device you picked is not connected right now. Pick it again when it is back."
+              : undefined
+      }
+    >
+      <Select
+        value={clientId === null ? NO_SELF_DEVICE : String(clientId)}
+        onValueChange={(value) => void choose(value)}
+      >
+        <SelectTrigger className={triggerClass} style={{ maxWidth: 178 }}>
+          <SelectValue>
+            <span className='truncate'>
+              {named ? displayName(named) : missing ? "Not connected" : "Choose…"}
+            </span>
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent className={selectContentClass}>
+          <SelectItem value={NO_SELF_DEVICE} className={selectItemClass}>
+            None
+          </SelectItem>
+          {devices.length === 0 && (
+            <div className='px-2 py-1.5 text-xs text-muted-foreground'>
+              Waiting for the router to list your devices…
+            </div>
+          )}
+          {devices.map((device) => (
+            <SelectItem
+              key={device.clientId}
+              value={String(device.clientId)}
+              className={selectItemClass}
+            >
+              <span className='flex flex-col items-start gap-px'>
+                <span>{displayName(device)}</span>
+                <span className='text-[10.5px] text-muted-foreground'>
+                  {[device.macAddress, device.ipAddress].filter(Boolean).join(" · ")}
+                </span>
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </SettingRow>
+  );
+}
+
+export function AppSettingsTab({ clients }: { clients: WifiClientJson[] }) {
   const toolbarStyle = useSyncExternalStore(subscribeToToolbarStyle, readToolbarStyle);
   const menuBar = useMenuBarThroughput();
   const webhook = useWebhookSettings();
@@ -164,6 +275,8 @@ export function AppSettingsTab() {
           </SelectContent>
         </Select>
       </SettingRow>
+
+      <SelfDeviceRow clients={clients} />
 
       {menuBar && (
         <SettingRow
@@ -194,7 +307,8 @@ export function AppSettingsTab() {
           disabled={webhook.saving}
           onChange={(event) => webhook.setDraftUrl(event.target.value)}
           onBlur={() => {
-            if (webhook.draftUrl !== webhook.config?.url) void webhook.save({ url: webhook.draftUrl });
+            if (webhook.draftUrl !== webhook.config?.url)
+              void webhook.save({ url: webhook.draftUrl });
           }}
         />
         <button
@@ -211,7 +325,9 @@ export function AppSettingsTab() {
                 : "Send test"}
         </button>
       </div>
-      {webhook.error && <div className='pb-[8px] text-[12px] text-destructive'>{webhook.error}</div>}
+      {webhook.error && (
+        <div className='pb-[8px] text-[12px] text-destructive'>{webhook.error}</div>
+      )}
     </>
   );
 }

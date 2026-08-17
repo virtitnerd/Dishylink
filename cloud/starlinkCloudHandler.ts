@@ -9,9 +9,18 @@
 
 import { GrpcWebError, grpcWebUnaryCall } from "../core/grpcWeb";
 import type { RouterClientUpdate } from "../core/routerClientUpdate";
-import { SUBNET_OPTIONS, type NetworkMode, type RouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate";
+import {
+  SUBNET_OPTIONS,
+  type NetworkMode,
+  type RouterWifiConfigUpdate,
+} from "../core/routerWifiConfigUpdate";
 import type { DishConfigJson } from "../core/dishClient";
 import type { DishUpdate } from "../core/dishConfigUpdate";
+import {
+  normalizeNameservers,
+  subnetRefusal,
+  type RouterConfigUpdate,
+} from "../core/routerConfigUpdate";
 
 const VALID_NETWORK_MODES: ReadonlySet<NetworkMode> = new Set(["default", "guest", "auto"]);
 const VALID_SECURITY_TYPES: ReadonlySet<string> = new Set(["wpa2", "wpa3", "wpa2wpa3", "open"]);
@@ -54,7 +63,10 @@ const VALID_VHT_BANDWIDTHS: ReadonlySet<string> = new Set([
  *  check against) -- just bound them to a range no real channel exceeds, so a
  *  stray value can't reach the router as something wildly malformed. */
 function isValidChannel(value: unknown): boolean {
-  return value === undefined || (Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 200);
+  return (
+    value === undefined ||
+    (Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 200)
+  );
 }
 const VALID_SNOW_MELT_MODES: ReadonlySet<string> = new Set(["AUTO", "ALWAYS_ON", "ALWAYS_OFF"]);
 const VALID_LOCATION_MODES: ReadonlySet<string> = new Set(["NONE", "LOCAL"]);
@@ -114,6 +126,25 @@ export interface CloudHandlerOptions {
   prepareWifiConfigUpdate?: (update: RouterWifiConfigUpdate) => Promise<Uint8Array>;
   /** Same trust boundary again, for the dish itself -- see dishConfigUpdate.ts. */
   prepareDishUpdate?: (update: DishUpdate) => Promise<Uint8Array>;
+  /** Trusted host callback: encodes exactly one router config change against the
+   *  target this handler resolved from the account. Unlike the callbacks above it
+   *  reads nothing from the LAN, which is what lets a bypassed router — invisible
+   *  on the local network by definition — still be configured. */
+  prepareRouterConfigUpdate?: (
+    update: RouterConfigUpdate,
+    targetId: string,
+    /** Sends one encoded request through the same authenticated gateway and
+     *  returns the raw reply. A subnet change needs it: the write has to carry
+     *  the network block the router currently reports. */
+    callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
+  ) => Promise<Uint8Array>;
+  /** Trusted host callback: reads the router's current subnet through the same
+   *  gateway. Like the write above it touches no LAN, so it answers for a router
+   *  the local network cannot see. */
+  readRouterSubnet?: (
+    targetId: string,
+    callGateway: (requestBytes: Uint8Array) => Promise<Uint8Array>,
+  ) => Promise<string | null>;
 }
 
 /** The durable half of the session — without it a token refresh can't happen, so
@@ -200,12 +231,16 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
   const prepareDeviceUpdate = options.prepareDeviceUpdate;
   const prepareWifiConfigUpdate = options.prepareWifiConfigUpdate;
   const prepareDishUpdate = options.prepareDishUpdate;
+  const prepareRouterConfigUpdate = options.prepareRouterConfigUpdate;
+  const readRouterSubnet = options.readRouterSubnet;
 
   let cachedCookie: string | null = null;
   let cachedAt = 0;
   let refreshInFlight: Promise<string | null> | null = null;
   let cachedIds: { acc: string; sl: string } | null = null;
   let cachedIdsAt = 0;
+  let cachedControllerId: string | null = null;
+  let cachedControllerIdAt = 0;
   let deviceMutationTail: Promise<void> = Promise.resolve();
 
   function forgetSession() {
@@ -213,6 +248,8 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     cachedAt = 0;
     cachedIds = null;
     cachedIdsAt = 0;
+    cachedControllerId = null;
+    cachedControllerIdAt = 0;
   }
 
   /** Swap in a freshly-minted Access.V1 (the webagg/telemetryagg calls 401
@@ -345,6 +382,37 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     return cachedIds;
   }
 
+  /**
+   * The router to configure, named by the account rather than by the LAN.
+   *
+   * A mesh node reports as a router too, so the id cannot simply be "the one
+   * router on the account" — this kit has two. `WifiHopsFromController` is what
+   * separates them: the controller is zero hops from itself, and every node sits
+   * behind it. Sourcing this from telemetry rather than the local router is the
+   * whole reason a bypassed kit, which answers nothing on the LAN, can still be
+   * configured.
+   */
+  async function resolveControllerId(cookie: string): Promise<string> {
+    if (cachedControllerId && Date.now() - cachedControllerIdAt < IDS_TTL_MS) {
+      return cachedControllerId;
+    }
+    const { acc } = await resolveIds(cookie);
+    const telemetry = await apiPost("/device-data/cache/v1/telemetry", cookie, {
+      accountNumber: acc,
+    });
+    const routers = Object.entries(deviceTelemetryFrom(telemetry)).filter(
+      ([, device]) => device.kind === "router",
+    );
+    if (routers.length === 0) throw new Error("no Starlink router on this account");
+    const controller =
+      routers.find(([, device]) => device.hops === 0) ??
+      (routers.length === 1 ? routers[0] : undefined);
+    if (!controller) throw new Error("could not tell which router is the controller");
+    cachedControllerId = controller[0];
+    cachedControllerIdAt = Date.now();
+    return cachedControllerId;
+  }
+
   /** `route` is the path without query, e.g. "/cloud/account". */
   async function handle(route: string): Promise<CloudResult> {
     if (!readCookie()) return NOT_CONNECTED;
@@ -379,6 +447,20 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
           return apiPost("/device-data/cache/v1/telemetry", cookie, { accountNumber: acc });
         });
         return { status: 200, body };
+      }
+      if (route === "/cloud/router-subnet") {
+        if (!readRouterSubnet) return { status: 503, body: { error: "router_subnet_unavailable" } };
+        const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
+        const subnet = await withFreshCookie(async (cookie) => {
+          const targetId = await resolveControllerId(cookie);
+          return readRouterSubnet(targetId, (requestBytes) =>
+            grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
+              fetch: doFetch,
+              headers: { cookie },
+            }),
+          );
+        }, abortSignal);
+        return { status: 200, body: { subnet } };
       }
       return { status: 404, body: { error: "unknown_cloud_route", route } };
     } catch (error) {
@@ -547,13 +629,16 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
         typeof update.networkDomain === "string" &&
         update.networkDomain.length > 0 &&
         (update.mode === undefined || VALID_NETWORK_MODES.has(update.mode)) &&
-        (update.ipv4 === undefined || (SUBNET_OPTIONS as readonly string[]).includes(update.ipv4)) &&
+        (update.ipv4 === undefined ||
+          (SUBNET_OPTIONS as readonly string[]).includes(update.ipv4)) &&
         (update.dhcpv4Start === undefined ||
           (Number.isInteger(update.dhcpv4Start) &&
             update.dhcpv4Start >= 2 &&
             update.dhcpv4Start <= 254)) &&
         (update.dhcpv4End === undefined ||
-          (Number.isInteger(update.dhcpv4End) && update.dhcpv4End >= 2 && update.dhcpv4End <= 254)) &&
+          (Number.isInteger(update.dhcpv4End) &&
+            update.dhcpv4End >= 2 &&
+            update.dhcpv4End <= 254)) &&
         (update.dhcpv4LeaseDurationS === undefined ||
           (Number.isInteger(update.dhcpv4LeaseDurationS) &&
             update.dhcpv4LeaseDurationS > 0 &&
@@ -579,29 +664,44 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
       return typeof update.networkDomain === "string" && update.networkDomain.length > 0;
     if (update?.kind === "routerAdvanced")
       return (
-        (update.disableSandboxFailOpen === undefined || typeof update.disableSandboxFailOpen === "boolean") &&
-        (update.txPowerLevel2ghz === undefined || VALID_TX_POWER_LEVELS.has(update.txPowerLevel2ghz)) &&
-        (update.txPowerLevel5ghz === undefined || VALID_TX_POWER_LEVELS.has(update.txPowerLevel5ghz)) &&
-        (update.txPowerLevel5ghzHigh === undefined || VALID_TX_POWER_LEVELS.has(update.txPowerLevel5ghzHigh)) &&
+        (update.disableSandboxFailOpen === undefined ||
+          typeof update.disableSandboxFailOpen === "boolean") &&
+        (update.txPowerLevel2ghz === undefined ||
+          VALID_TX_POWER_LEVELS.has(update.txPowerLevel2ghz)) &&
+        (update.txPowerLevel5ghz === undefined ||
+          VALID_TX_POWER_LEVELS.has(update.txPowerLevel5ghz)) &&
+        (update.txPowerLevel5ghzHigh === undefined ||
+          VALID_TX_POWER_LEVELS.has(update.txPowerLevel5ghzHigh)) &&
         (update.disable2ghz === undefined || typeof update.disable2ghz === "boolean") &&
         (update.disable5ghz === undefined || typeof update.disable5ghz === "boolean") &&
         (update.disable5ghzHigh === undefined || typeof update.disable5ghzHigh === "boolean") &&
         isValidChannel(update.channel2ghz) &&
         isValidChannel(update.channel5ghz) &&
         isValidChannel(update.channel5ghzHigh) &&
-        (update.wirelessMode2ghz === undefined || VALID_WIRELESS_MODES.has(update.wirelessMode2ghz)) &&
-        (update.wirelessMode5ghz === undefined || VALID_WIRELESS_MODES.has(update.wirelessMode5ghz)) &&
-        (update.wirelessMode5ghzHigh === undefined || VALID_WIRELESS_MODES.has(update.wirelessMode5ghzHigh)) &&
+        (update.wirelessMode2ghz === undefined ||
+          VALID_WIRELESS_MODES.has(update.wirelessMode2ghz)) &&
+        (update.wirelessMode5ghz === undefined ||
+          VALID_WIRELESS_MODES.has(update.wirelessMode5ghz)) &&
+        (update.wirelessMode5ghzHigh === undefined ||
+          VALID_WIRELESS_MODES.has(update.wirelessMode5ghzHigh)) &&
         (update.htBandwidth2ghz === undefined || VALID_HT_BANDWIDTHS.has(update.htBandwidth2ghz)) &&
         (update.htBandwidth5ghz === undefined || VALID_HT_BANDWIDTHS.has(update.htBandwidth5ghz)) &&
-        (update.htBandwidth5ghzHigh === undefined || VALID_HT_BANDWIDTHS.has(update.htBandwidth5ghzHigh)) &&
+        (update.htBandwidth5ghzHigh === undefined ||
+          VALID_HT_BANDWIDTHS.has(update.htBandwidth5ghzHigh)) &&
         (update.vhtBandwidth === undefined || VALID_VHT_BANDWIDTHS.has(update.vhtBandwidth)) &&
-        (update.vhtBandwidth5ghzHigh === undefined || VALID_VHT_BANDWIDTHS.has(update.vhtBandwidth5ghzHigh)) &&
-        (update.disableBandSteering === undefined || typeof update.disableBandSteering === "boolean") &&
-        (update.disableMeshOnboarding === undefined || typeof update.disableMeshOnboarding === "boolean")
+        (update.vhtBandwidth5ghzHigh === undefined ||
+          VALID_VHT_BANDWIDTHS.has(update.vhtBandwidth5ghzHigh)) &&
+        (update.disableBandSteering === undefined ||
+          typeof update.disableBandSteering === "boolean") &&
+        (update.disableMeshOnboarding === undefined ||
+          typeof update.disableMeshOnboarding === "boolean")
       );
     if (update?.kind === "meshTrust")
-      return typeof update.deviceId === "string" && update.deviceId.length > 0 && typeof update.trusted === "boolean";
+      return (
+        typeof update.deviceId === "string" &&
+        update.deviceId.length > 0 &&
+        typeof update.trusted === "boolean"
+      );
     return false;
   }
 
@@ -650,11 +750,11 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
           r &&
           typeof r === "object" &&
           typeof (r as { subnet?: unknown }).subnet === "string" &&
-          ((r as { subnet: string }).subnet.length > 0) &&
-          ((r as { subnet: string }).subnet.length <= 64) &&
+          (r as { subnet: string }).subnet.length > 0 &&
+          (r as { subnet: string }).subnet.length <= 64 &&
           typeof (r as { gateway?: unknown }).gateway === "string" &&
-          ((r as { gateway: string }).gateway.length > 0) &&
-          ((r as { gateway: string }).gateway.length <= 64),
+          (r as { gateway: string }).gateway.length > 0 &&
+          (r as { gateway: string }).gateway.length <= 64,
       )
     );
   }
@@ -796,7 +896,8 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
    *  keeps the model simple and avoids firing concurrent calls at the same
    *  cloud Device.Handle endpoint. */
   function updateDishConfig(update: DishUpdate): Promise<CloudResult> {
-    if (!validDishUpdate(update)) return Promise.resolve({ status: 400, body: { error: "bad_request" } });
+    if (!validDishUpdate(update))
+      return Promise.resolve({ status: 400, body: { error: "bad_request" } });
 
     const mutation = deviceMutationTail.then(() => applyDishUpdate(update));
     deviceMutationTail = mutation.then(
@@ -806,5 +907,86 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
     return mutation;
   }
 
-  return { handle, connect, disconnect, updateClient, updateWifiConfig, updateDishConfig };
+  async function applyRouterConfigUpdate(update: RouterConfigUpdate): Promise<CloudResult> {
+    if (!readCookie()) return NOT_CONNECTED;
+    let configWriteDispatched = false;
+    try {
+      if (!prepareRouterConfigUpdate)
+        return { status: 503, body: { error: "router_config_update_unavailable" } };
+      const abortSignal = AbortSignal.timeout(deviceCallTimeoutMs);
+      await withFreshCookie(async (cookie) => {
+        const targetId = await resolveControllerId(cookie);
+        const callGateway = (requestBytes: Uint8Array) =>
+          grpcWebUnaryCall(DEVICE_HANDLE, requestBytes, abortSignal, {
+            fetch: doFetch,
+            headers: { cookie },
+          });
+        const requestBytes = await prepareRouterConfigUpdate(update, targetId, callGateway);
+        try {
+          configWriteDispatched = true;
+          await callGateway(requestBytes);
+        } catch (error) {
+          if (error instanceof GrpcWebError && error.grpcStatus === 16)
+            throw new SessionExpiredError();
+          throw error;
+        }
+      }, abortSignal);
+      return { status: 200, body: { ok: true } };
+    } catch (error) {
+      if (error instanceof SessionExpiredError) return NOT_CONNECTED;
+      // A subnet change and a bypass switch both reconfigure the LAN carrying
+      // them, so a write that takes effect kills its own reply. How that surfaces
+      // is the host's business: a deadline where the request is left hanging, a
+      // dead socket where it is not — a service worker's fetch rejects the moment
+      // the network goes. Neither is the far end refusing, and only the far end
+      // can refuse.
+      const seversItsOwnReply = update.kind === "subnet" || update.kind === "bypass";
+      if (seversItsOwnReply && configWriteDispatched && !(error instanceof GrpcWebError)) {
+        return { status: 200, body: { ok: true, applied: true } };
+      }
+      if (error instanceof DOMException && error.name === "TimeoutError") {
+        return {
+          status: 504,
+          body: {
+            error: "device_call_timeout",
+            message: "Starlink did not answer the router change in time. Try again.",
+          },
+        };
+      }
+      return {
+        status: 502,
+        body: { error: "device_call_failed", message: (error as Error).message },
+      };
+    }
+  }
+
+  /** The renderer names a field and its new value, never protobuf. Anything
+   *  outside these shapes is refused before the account is touched. */
+  function validRouterConfig(update: RouterConfigUpdate): boolean {
+    if (update?.kind === "subnet") {
+      if (typeof update.subnet !== "string" || typeof update.password !== "string") return false;
+      return subnetRefusal(update.subnet, update.password) === null;
+    }
+    if (update?.kind === "bypass") return typeof update.enabled === "boolean";
+    if (update?.kind !== "customDns") return false;
+    if (!Array.isArray(update.nameservers)) return false;
+    if (!update.nameservers.every((server) => typeof server === "string")) return false;
+    return normalizeNameservers(update.nameservers) !== null;
+  }
+
+  function updateRouterConfig(update: RouterConfigUpdate): Promise<CloudResult> {
+    if (!validRouterConfig(update))
+      return Promise.resolve({ status: 400, body: { error: "bad_request" } });
+    return applyRouterConfigUpdate(update);
+  }
+
+  return {
+    handle,
+    connect,
+    disconnect,
+    updateClient,
+    updateWifiConfig,
+    updateDishConfig,
+    updateRouterConfig,
+  };
 }

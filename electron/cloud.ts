@@ -12,6 +12,12 @@ import { createCloudHandler } from "../cloud/starlinkCloudHandler";
 import { DishClient, ROUTER_LAN_HANDLE_URL } from "../core/dishClient";
 import { prepareDishUpdate } from "../core/dishConfigUpdate";
 import type { DishUpdate } from "../core/dishConfigUpdate";
+import {
+  buildRouterConfigRequest,
+  readCurrentNetworks,
+  readCurrentSubnet,
+  type RouterConfigUpdate,
+} from "../core/routerConfigUpdate";
 import { prepareRouterClientUpdate } from "../core/routerClientUpdate";
 import type { RouterClientUpdate } from "../core/routerClientUpdate";
 import { localNetworkIdentity } from "../core/hostNetworkIdentity";
@@ -76,6 +82,25 @@ export function startCloud(rendererRoot: string): void {
       });
       return prepareDishUpdate(await dishPromise, update);
     },
+    // Encoding only — the client is never dialled here, so this works on a kit
+    // whose router answers nothing on the LAN. A subnet change reads the current
+    // networks through the caller's gateway, which has the same reach.
+    prepareRouterConfigUpdate: async (update, targetId, callGateway) => {
+      routerPromise ??= DishClient.load("router", {
+        handleUrl: ROUTER_LAN_HANDLE_URL,
+        protosetBytes: new Uint8Array(readFileSync(protosetPath)),
+      });
+      const client = await routerPromise;
+      const networks = await readCurrentNetworks(update, client, targetId, callGateway);
+      return client.encodeRequest(buildRouterConfigRequest(targetId, update, networks));
+    },
+    readRouterSubnet: async (targetId, callGateway) => {
+      routerPromise ??= DishClient.load("router", {
+        handleUrl: ROUTER_LAN_HANDLE_URL,
+        protosetBytes: new Uint8Array(readFileSync(protosetPath)),
+      });
+      return readCurrentSubnet(await routerPromise, targetId, callGateway);
+    },
   });
 }
 
@@ -116,6 +141,12 @@ export async function handleCloudRequest(request: Request): Promise<Response> {
   if (route === "/cloud/dish-config" && request.method === "POST") {
     const update = (await request.json().catch(() => ({}))) as DishUpdate;
     const { status, body } = await handler.updateDishConfig(update);
+    return json(status, body);
+  }
+
+  if (route === "/cloud/router-config" && request.method === "POST") {
+    const update = (await request.json().catch(() => ({}))) as RouterConfigUpdate;
+    const { status, body } = await handler.updateRouterConfig(update);
     return json(status, body);
   }
 

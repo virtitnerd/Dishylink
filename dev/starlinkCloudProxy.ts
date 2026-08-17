@@ -13,6 +13,12 @@ import type { Plugin } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createCloudHandler } from "../cloud/starlinkCloudHandler.ts";
 import { DishClient, ROUTER_LAN_HANDLE_URL, setApiBase } from "../core/dishClient.ts";
+import {
+  buildRouterConfigRequest,
+  readCurrentNetworks,
+  readCurrentSubnet,
+  type RouterConfigUpdate,
+} from "../core/routerConfigUpdate.ts";
 import { prepareRouterClientUpdate } from "../core/routerClientUpdate.ts";
 import type { RouterClientUpdate } from "../core/routerClientUpdate.ts";
 import { prepareRouterWifiConfigUpdate } from "../core/routerWifiConfigUpdate.ts";
@@ -111,6 +117,24 @@ export function starlinkCloudProxy(): Plugin {
           dishPromise ??= DishClient.load("dish", { protosetBytes: protosetBytes() });
           return prepareDishUpdate(await dishPromise, update);
         },
+        // Encoding only — the client is never dialled here, so this works on a
+        // kit whose router answers nothing on the LAN.
+        prepareRouterConfigUpdate: async (update, targetId, callGateway) => {
+          routerPromise ??= DishClient.load("router", {
+            handleUrl: ROUTER_LAN_HANDLE_URL,
+            protosetBytes: protosetBytes(),
+          });
+          const client = await routerPromise;
+          const networks = await readCurrentNetworks(update, client, targetId, callGateway);
+          return client.encodeRequest(buildRouterConfigRequest(targetId, update, networks));
+        },
+        readRouterSubnet: async (targetId, callGateway) => {
+          routerPromise ??= DishClient.load("router", {
+            handleUrl: ROUTER_LAN_HANDLE_URL,
+            protosetBytes: protosetBytes(),
+          });
+          return readCurrentSubnet(await routerPromise, targetId, callGateway);
+        },
       });
       server.middlewares.use(async (req: IncomingMessage, res: ServerResponse, next) => {
         const url = req.url ?? "";
@@ -164,6 +188,16 @@ export function starlinkCloudProxy(): Plugin {
           try {
             const update = JSON.parse((await readBody(req)) || "{}") as DishUpdate;
             const result = await handler.updateDishConfig(update);
+            return sendJson(res, result.status, result.body);
+          } catch (error) {
+            return sendJson(res, 400, { error: "bad_request", message: (error as Error).message });
+          }
+        }
+
+        if (route === "/cloud/router-config" && req.method === "POST") {
+          try {
+            const update = JSON.parse((await readBody(req)) || "{}") as RouterConfigUpdate;
+            const result = await handler.updateRouterConfig(update);
             return sendJson(res, result.status, result.body);
           } catch (error) {
             return sendJson(res, 400, { error: "bad_request", message: (error as Error).message });

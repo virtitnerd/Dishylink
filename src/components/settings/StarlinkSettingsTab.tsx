@@ -201,7 +201,7 @@ export function StarlinkSettingsTab({
             />
           </SettingRow>
           {sleepEnabled && (
-            <div className='flex items-center gap-2 pb-[8px] pl-0.5'>
+            <div className='flex items-center justify-end gap-2 pb-[8px]'>
               <span className='mt-px block text-[12px] text-muted-foreground'>from</span>
               <TimePicker
                 minutes={sleepStartLocal}
@@ -312,11 +312,13 @@ export function StarlinkSettingsTab({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent className={selectContentClass}>
-                {(Object.keys(LEVEL_DISH_LABEL) as Array<"TILT_LIKE_NORMAL" | "FORCE_LEVEL">).map((mode) => (
-                  <SelectItem key={mode} value={mode} className={selectItemClass}>
-                    {LEVEL_DISH_LABEL[mode]}
-                  </SelectItem>
-                ))}
+                {(Object.keys(LEVEL_DISH_LABEL) as Array<"TILT_LIKE_NORMAL" | "FORCE_LEVEL">).map(
+                  (mode) => (
+                    <SelectItem key={mode} value={mode} className={selectItemClass}>
+                      {LEVEL_DISH_LABEL[mode]}
+                    </SelectItem>
+                  ),
+                )}
               </SelectContent>
             </Select>
           </SettingRow>

@@ -31,6 +31,7 @@ import { createFileRegistry, fromBinary, toJson, type DescMessage } from "@bufbu
 import { FileDescriptorSetSchema } from "@bufbuild/protobuf/wkt";
 import { grpcWebUnaryCall } from "../core/grpcWeb.ts";
 import { createRouterOrigins } from "../core/routerEndpoint.ts";
+import { readDevRouterAddress } from "./devRouterAddress.mts";
 import {
   decodeHistoryWindow,
   decodeOutageEvents,
@@ -58,6 +59,24 @@ import { ObstructionStore, packCells } from "./obstructionStore.mts";
 
 const DISH_URL =
   process.env.DISH_URL ?? "http://192.168.100.1:9201/SpaceX.API.Device.Device/Handle";
+
+/**
+ * Where the router is, when 192.168.1.1 is wrong for this kit. A host with a
+ * user-facing setting installs a reader here, consulted per call: this process
+ * runs for weeks, so a value read once at import would take effect at the next
+ * restart, which is to say never.
+ *
+ * Standing alone, nothing installs one, so the default is the dev file the dev
+ * server dials through — a recording made beside a dev window then covers the
+ * same router that window shows.
+ */
+let readConfiguredRouterAddress: () => string | null = process.env.HISTORIAN_EMBED
+  ? () => null
+  : readDevRouterAddress;
+
+export function setRouterAddressReader(reader: () => string | null): void {
+  readConfiguredRouterAddress = reader;
+}
 // Where the collector reads and writes. Defaults to the repo's collector/data for
 // the dev process; a host (the Electron app) points it at its own per-user data dir.
 const DATA_DIR = process.env.HISTORIAN_DATA_DIR ?? resolve("collector/data");
@@ -112,11 +131,13 @@ const ROUTER_PATH = "/SpaceX.API.Device.Device/Handle";
  *  process at a stand-in, and for the probe scripts under scripts/. */
 const ROUTER_URL_OVERRIDE = process.env.ROUTER_URL ?? null;
 
-const routerOrigins = createRouterOrigins(() =>
-  Object.values(networkInterfaces())
-    .flat()
-    .filter((entry) => entry && entry.family === "IPv6" && !entry.internal)
-    .map((entry) => entry!.address),
+const routerOrigins = createRouterOrigins(
+  () =>
+    Object.values(networkInterfaces())
+      .flat()
+      .filter((entry) => entry && entry.family === "IPv6" && !entry.internal)
+      .map((entry) => entry!.address),
+  () => readConfiguredRouterAddress(),
 );
 
 /**

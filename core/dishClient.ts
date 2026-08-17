@@ -18,6 +18,7 @@ import {
   fromBinary,
   fromJson,
   toBinary,
+  toJson,
   type DescMessage,
   type JsonValue,
   type Registry,
@@ -63,6 +64,11 @@ export function setApiBase(base: string): void {
  *  to reach it into the one wording every surface reports. */
 export const ROUTER_LAN_ADDRESS = "192.168.1.1";
 export const ROUTER_LAN_HANDLE_URL = `http://${ROUTER_LAN_ADDRESS}:9001/SpaceX.API.Device.Device/Handle`;
+
+/** The dish's LAN address. Fixed, unlike the router's -- there is no dish-side
+ *  equivalent of a subnet change. Used for Electron's app:// proxy origin
+ *  (electron/appProtocol.ts) and shown as a courtesy in the searching state. */
+export const DISH_LAN_ADDRESS = "192.168.100.1";
 
 /**
  * @deprecated No-op kept only so the Electron/extension entry points (which
@@ -369,7 +375,8 @@ export type WirelessMode =
   | "B_G_N_AX_MIXED"
   | "A_AN_AC_AX_MIXED";
 
-export type HtBandwidth = "HT_BANDWIDTH_DEFAULT" | "HT_BANDWIDTH_20_MHZ" | "HT_BANDWIDTH_20_OR_40_MHZ";
+export type HtBandwidth =
+  "HT_BANDWIDTH_DEFAULT" | "HT_BANDWIDTH_20_MHZ" | "HT_BANDWIDTH_20_OR_40_MHZ";
 
 export type VhtBandwidth =
   | "VHT_BANDWIDTH_DEFAULT"
@@ -378,8 +385,19 @@ export type VhtBandwidth =
   | "VHT_BANDWIDTH_160_MHZ"
   | "VHT_BANDWIDTH_80_PLUS_80_MHZ";
 
+/** A decoded Device.Response, narrowed to the one field decodeResponse's caller
+ *  reads today -- see routerConfigUpdate.ts's readCurrentNetworks/readCurrentSubnet. */
+export interface DishResponseJson {
+  wifiGetConfig?: { wifiConfig?: WifiNetworkConfigJson };
+}
+
 export interface WifiNetworkConfigJson {
   countryCode?: string;
+  /** The DNS servers the router forwards to. Absent means Starlink's own — proto3
+   *  omits an empty repeated field, so absent and empty are the same answer. */
+  nameservers?: string[];
+  /** True when this kit is not permitted to set custom DNS at all. */
+  customDnsDisabled?: boolean;
   networks?: WifiLanNetworkJson[];
   meshConfigs?: Record<string, WifiMeshNodeJson>;
   clientConfigs?: WifiClientConfigJson[];
@@ -387,8 +405,6 @@ export interface WifiNetworkConfigJson {
   /** Disables the router's own WiFi in favor of a third-party router on its
    *  ethernet port. Read-only here -- see setBypassMode's own risk note. */
   bypassMode?: boolean;
-  nameservers?: string[];
-  customDnsDisabled?: boolean;
   /** Whether content filtering fails open (internet keeps working, unfiltered)
    *  or closed (internet blocks entirely) if the filtering service itself is
    *  unreachable. Only meaningful while content filtering is on. */
@@ -573,7 +589,10 @@ export class DishClient {
      *  why: its process can't do a relative `fetch("/dish.protoset")` the way
      *  a browser tab can). Everything else falls back to loadRequestSchema's
      *  lazy HTTP fetch, shared module-wide. */
-    private readonly schemaOverride: Promise<{ requestSchema: DescMessage; registry: Registry }> | null = null,
+    private readonly schemaOverride: Promise<{
+      requestSchema: DescMessage;
+      registry: Registry;
+    }> | null = null,
   ) {}
 
   /**
@@ -591,9 +610,7 @@ export class DishClient {
     target: "dish" | "router" = "dish",
     options: { handleUrl?: string; protosetUrl?: string; protosetBytes?: Uint8Array } = {},
   ): Promise<DishClient> {
-    const schemaOverride = options.protosetBytes
-      ? parseRequestSchema(options.protosetBytes)
-      : null;
+    const schemaOverride = options.protosetBytes ? parseRequestSchema(options.protosetBytes) : null;
     return new DishClient(target, schemaOverride);
   }
 
@@ -658,6 +675,18 @@ export class DishClient {
     return toBinary(requestSchema, fromJson(requestSchema, requestJson as JsonValue, { registry }));
   }
 
+  /** Decode a Device.Response the host fetched through the cloud gateway. Only
+   *  the shape a caller actually reads is declared -- see routerConfigUpdate.ts's
+   *  wifiGetConfig read, the one consumer today. */
+  async decodeResponse(responseBytes: Uint8Array): Promise<DishResponseJson> {
+    const { registry } = await (this.schemaOverride ?? loadRequestSchema());
+    const responseSchema = registry.getMessage("SpaceX.API.Device.Response");
+    if (!responseSchema) throw new Error("Device Response missing from dish.protoset");
+    return toJson(responseSchema, fromBinary(responseSchema, responseBytes), {
+      registry,
+    }) as DishResponseJson;
+  }
+
   /** Current dish configuration (sleep schedule, snow melt, update window …). */
   async getConfig(abortSignal?: AbortSignal): Promise<DishConfigJson & Record<string, unknown>> {
     const data = await apiGet<{ dishConfig?: DishConfigJson & Record<string, unknown> }>(
@@ -695,7 +724,10 @@ export class DishClient {
 
   /** Router WiFi configuration (SSID, channels, mesh) — ROUTER target. */
   async getWifiConfig(abortSignal?: AbortSignal): Promise<WifiNetworkConfigJson> {
-    const data = await apiGet<{ wifiConfig?: WifiNetworkConfigJson }>("/router/config", abortSignal);
+    const data = await apiGet<{ wifiConfig?: WifiNetworkConfigJson }>(
+      "/router/config",
+      abortSignal,
+    );
     return data.wifiConfig ?? {};
   }
 
@@ -706,6 +738,10 @@ export class DishClient {
     givenName: string,
     abortSignal?: AbortSignal,
   ): Promise<void> {
-    await apiPost("/router/clients/name", { mac_address: macAddress, given_name: givenName }, abortSignal);
+    await apiPost(
+      "/router/clients/name",
+      { mac_address: macAddress, given_name: givenName },
+      abortSignal,
+    );
   }
 }

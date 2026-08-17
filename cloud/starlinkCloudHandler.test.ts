@@ -6,6 +6,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { createCloudHandler } from "./starlinkCloudHandler";
+import { GrpcWebError } from "../core/grpcWeb";
 
 const AUTH_URL = "https://api.starlink.com/auth-rp/auth/user";
 const SESSION = "Starlink.Com.Sso=sso-value; Starlink.Com.Access.V1=old-token";
@@ -386,7 +387,10 @@ describe("createCloudHandler updateDishConfig", () => {
     });
 
     await expect(
-      handler.updateDishConfig({ kind: "config", changes: { swupdateThreeDayDeferralEnabled: true } }),
+      handler.updateDishConfig({
+        kind: "config",
+        changes: { swupdateThreeDayDeferralEnabled: true },
+      }),
     ).resolves.toMatchObject({ status: 428 });
     expect(prepared).toBe(false);
   });
@@ -436,6 +440,149 @@ describe("createCloudHandler updateDishConfig", () => {
     ).resolves.toMatchObject({ status: 400 });
     await expect(
       handler.updateDishConfig({ kind: "config", changes: { powerSaveDurationMinutes: -5 } }),
+    ).resolves.toMatchObject({ status: 400 });
+    expect(prepared).toBe(false);
+  });
+});
+
+describe("updateRouterConfig", () => {
+  const TARGET = "Router-010000000000000001B31340";
+  const SUBNET = { kind: "subnet" as const, subnet: "192.168.2.1/24", password: "hunter2hunter2" };
+
+  /** Answers everything the controller lookup needs, then defers the device
+   *  gateway to `onDevice`. */
+  function gateway(onDevice: (init?: RequestInit) => Promise<Response>) {
+    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === AUTH_URL) return res(200);
+      if (url.includes("service-lines"))
+        return res(200, {
+          content: { results: [{ serviceLineNumber: "SL-1", accountReferenceId: "ACC-1" }] },
+        });
+      if (url.includes("/device-data/cache/v1/telemetry"))
+        return res(200, {
+          data: {
+            columnNamesByDeviceType: { r: ["DeviceId", "WifiHopsFromController"] },
+            values: [["r", TARGET, 0]],
+          },
+        });
+      return onDevice(init);
+    }) as typeof fetch;
+  }
+
+  const stall = (init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    });
+
+  it("given: the write itself stalls, should: report the subnet change as applied", async () => {
+    const handler = createCloudHandler({
+      fetch: gateway(stall),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      deviceCallTimeoutMs: 5,
+      prepareRouterConfigUpdate: async () => new Uint8Array(),
+    });
+
+    await expect(handler.updateRouterConfig(SUBNET)).resolves.toMatchObject({
+      status: 200,
+      body: { applied: true },
+    });
+  });
+
+  it("given: the write dies with the network, should: report the subnet change as applied", async () => {
+    // What a service worker sees. Its fetch rejects the instant the LAN goes,
+    // rather than hanging until a deadline the way a desktop request does, so the
+    // same successful write arrives as a TypeError instead of a timeout.
+    const handler = createCloudHandler({
+      fetch: gateway(() => Promise.reject(new TypeError("Failed to fetch"))),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      prepareRouterConfigUpdate: async () => new Uint8Array(),
+    });
+
+    await expect(handler.updateRouterConfig(SUBNET)).resolves.toMatchObject({
+      status: 200,
+      body: { applied: true },
+    });
+  });
+
+  it("given: the far end refuses the write, should: report it as a failure", async () => {
+    // The one case that is genuinely a refusal: something answered. A dropped
+    // connection cannot say no, and this must not be swept up with it.
+    const handler = createCloudHandler({
+      fetch: gateway(() => Promise.reject(new GrpcWebError(3, "invalid argument"))),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      prepareRouterConfigUpdate: async () => new Uint8Array(),
+    });
+
+    await expect(handler.updateRouterConfig(SUBNET)).resolves.toMatchObject({
+      status: 502,
+      body: { error: "device_call_failed" },
+    });
+  });
+
+  it("given: the network dies before the write goes out, should: NOT claim the subnet moved", async () => {
+    const handler = createCloudHandler({
+      fetch: gateway(() => Promise.reject(new TypeError("Failed to fetch"))),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      // Consumes the gateway call standing in for the read, so the write never
+      // leaves and nothing has been asked of the router.
+      prepareRouterConfigUpdate: async (_update, _targetId, callGateway) =>
+        callGateway(new Uint8Array()),
+    });
+
+    await expect(handler.updateRouterConfig(SUBNET)).resolves.toMatchObject({
+      status: 502,
+      body: { error: "device_call_failed" },
+    });
+  });
+
+  it("given: the read before the write stalls, should: NOT claim the subnet moved", async () => {
+    const handler = createCloudHandler({
+      fetch: gateway(stall),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      deviceCallTimeoutMs: 5,
+      // Stands in for reading the current networks: it consumes the gateway call
+      // and never reaches the write.
+      prepareRouterConfigUpdate: async (_update, _targetId, send) => send(new Uint8Array()),
+    });
+
+    await expect(handler.updateRouterConfig(SUBNET)).resolves.toMatchObject({
+      status: 504,
+      body: { error: "device_call_timeout" },
+    });
+  });
+
+  it("given: a DNS write that stalls, should: stay retryable rather than claim success", async () => {
+    const handler = createCloudHandler({
+      fetch: gateway(stall),
+      readCookie: () => SESSION,
+      retryDelayMs: 0,
+      deviceCallTimeoutMs: 5,
+      prepareRouterConfigUpdate: async () => new Uint8Array(),
+    });
+
+    await expect(
+      handler.updateRouterConfig({ kind: "customDns", nameservers: ["1.1.1.1"] }),
+    ).resolves.toMatchObject({ status: 504 });
+  });
+
+  it("given: a passphrase outside WPA2's bounds, should: refuse before the account is touched", async () => {
+    let prepared = false;
+    const handler = createCloudHandler({
+      readCookie: () => SESSION,
+      prepareRouterConfigUpdate: async () => {
+        prepared = true;
+        return new Uint8Array();
+      },
+    });
+
+    await expect(
+      handler.updateRouterConfig({ ...SUBNET, password: "short" }),
     ).resolves.toMatchObject({ status: 400 });
     expect(prepared).toBe(false);
   });

@@ -35,7 +35,13 @@ import {
   selectItemClass,
   triggerClass,
 } from "./settingsChrome";
-import { useCloudAccount } from "../../hooks/useCloudAccount";
+import { RouterAddressRow } from "./RouterAddressRow";
+import { SubnetSection } from "./SubnetSection";
+import { routerAddressForSubnet } from "@core/routerConfigUpdate";
+import { routerAddressHost } from "../../lib/routerAddressHost";
+import { applyRouterConfigUpdate } from "../../lib/routerConfigUpdate";
+import { useCloudAccount, useCloudRouterSubnet } from "../../hooks/useCloudAccount";
+import { useRouterAddressState } from "../../hooks/useRouterAddress";
 import {
   SUBNET_OPTIONS,
   addRouterNetwork,
@@ -222,11 +228,15 @@ export function RouterSettingsTab({
   wifiConfig,
   routerReachable,
   unreachable,
+  onConfigChanged,
 }: {
   wifiConfig: WifiNetworkConfigJson | null;
   routerReachable: boolean | null;
   /** Why the router is silent, when it is. Null while it is answering. */
   unreachable: RouterUnreachable | null;
+  /** For a write that leaves the router up, which nothing else would re-read.
+   *  A write that takes it down is covered by the read on its return instead. */
+  onConfigChanged: () => void;
 }) {
   const networks = useMemo(() => networksOf(wifiConfig), [wifiConfig]);
   const meshNodes = Object.entries(wifiConfig?.meshConfigs ?? {});
@@ -237,6 +247,17 @@ export function RouterSettingsTab({
   // needs the account connected.
   const cloudAccount = useCloudAccount(true);
   const cloudConnected = cloudAccount.status === "ready";
+
+  // The subnet write has no local path (the router may not even be on the LAN
+  // once the account is the only way to reach it), so the control is disabled
+  // up front rather than failing at the moment Save is pressed.
+  const [addresses, setAddresses] = useRouterAddressState();
+  const lanSubnet = wifiConfig?.networks?.[0]?.ipv4 ?? null;
+  // The account is asked only when the router itself cannot answer, which costs
+  // a round trip to Starlink for something the LAN gives away for free.
+  const { data: cloudSubnet, reload: rereadCloudSubnet } = useCloudRouterSubnet(
+    cloudConnected && lanSubnet === null,
+  );
 
   const [editingDomain, setEditingDomain] = useState<string | null>(null);
   const [draft, setDraft] = useState<NetworkDraft | null>(null);
@@ -955,6 +976,33 @@ export function RouterSettingsTab({
           return "Reboot sent — the router is restarting.";
         }}
       />
+      {addresses && (
+        <>
+          <SectionLabel>Connection</SectionLabel>
+          <RouterAddressRow
+            addresses={addresses}
+            onChanged={(next) => {
+              setAddresses(next);
+              onConfigChanged();
+            }}
+          />
+        </>
+      )}
+      <SectionLabel>Network</SectionLabel>
+      <SubnetSection
+        currentSubnet={lanSubnet ?? cloudSubnet}
+        disabled={!cloudConnected}
+        onSave={async (subnet, password) => {
+          await applyRouterConfigUpdate({ kind: "subnet", password, subnet });
+          // The router is about to answer somewhere else, and this is the
+          // setting that decides where the app looks for it next.
+          const updatedAddresses = await routerAddressHost()?.write(routerAddressForSubnet(subnet));
+          if (updatedAddresses?.ok) setAddresses(updatedAddresses.addresses);
+          rereadCloudSubnet();
+          onConfigChanged();
+        }}
+      />
+
       <SectionLabel>Advanced</SectionLabel>
       <Callout tone={cloudConnected ? "info" : "error"} className='mb-1'>
         {cloudConnected
