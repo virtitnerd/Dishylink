@@ -10,9 +10,12 @@
 
 FROM node:22-slim AS frontend
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+# The full tree, not just the lockfile: npm ci's own postinstall (`wxt
+# prepare`) reads wxt.config.ts to find the extension's real entrypoints
+# directory (./extension/entrypoints, not WXT's default ./entrypoints) --
+# without it here yet, prepare falls back to the default and fails outright.
 COPY . .
+RUN npm ci
 RUN npm run build
 
 FROM python:3.12-slim AS runtime
