@@ -359,10 +359,23 @@ export function StarlinkSettingsTab({
             title='Reboot Starlink'
             caption='Internet drops for ~2–3 minutes while the dish restarts'
             buttonLabel='Reboot'
-            confirmLabel='Yes, reboot dish'
+            slideLabel='Slide to reboot dish'
+            confirmLabel='Reboot dish'
             onRun={async () => {
               await (await loadDish()).reboot();
               return "Reboot command sent — the dish is restarting.";
+            }}
+          />
+          <DangerAction
+            title='Factory reset Starlink'
+            caption='Wipes every dish setting back to how it shipped. Not reversible.'
+            buttonLabel='Factory reset'
+            slideLabel='Slide to factory reset the dish'
+            confirmLabel='Factory reset dish'
+            warning='Only factory reset as a last resort or when Starlink recommends it. Frequent factory resets can cause permanent hardware failure.'
+            onRun={async () => {
+              await (await loadDish()).factoryReset();
+              return "Factory reset sent — the dish is wiping and restarting.";
             }}
           />
           {isMotorized && (

@@ -245,11 +245,17 @@ export interface DishLocationJson {
   source?: string;
 }
 
+/** How the obstruction grid is oriented. FRAME_EARTH is north-up; FRAME_UT
+ *  is dish-relative (bottom-center is the boresight azimuth). Mini kits on
+ *  roam typically report FRAME_UT; a Standard on a fixed site reports FRAME_EARTH. */
+export type ObstructionMapReferenceFrame = "FRAME_UNKNOWN" | "FRAME_EARTH" | "FRAME_UT";
+
 export interface DishObstructionMapJson {
   numRows?: number;
   numCols?: number;
   snr?: number[];
   maxThetaDeg?: number;
+  mapReferenceFrame?: ObstructionMapReferenceFrame;
 }
 
 // ---------- config / diagnostics shapes ----------
@@ -660,6 +666,17 @@ export class DishClient {
   /** Reboot this device (dish or router). Drops connectivity for a few minutes. */
   async reboot(abortSignal?: AbortSignal): Promise<void> {
     await apiPost(this.target === "dish" ? "/reboot" : "/router/reboot", undefined, abortSignal);
+  }
+
+  /** Wipe the device back to its shipped state. On a router that includes the
+   *  WiFi name and passphrase, and bypass mode with them: it is the only exit
+   *  the official app leaves once bypass is on. FactoryResetRequest is empty. */
+  async factoryReset(abortSignal?: AbortSignal): Promise<void> {
+    await apiPost(
+      this.target === "dish" ? "/factory-reset" : "/router/factory-reset",
+      undefined,
+      abortSignal,
+    );
   }
 
   /** Stow (fold flat) or unstow the dish. Motorized (mast) models only -- a

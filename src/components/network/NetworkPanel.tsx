@@ -31,6 +31,7 @@ import { Callout } from "../ui/callout";
 import { SegmentedControl } from "../ui/segmented-control";
 import { RouterIcon } from "../../assets/icons/RouterIcon";
 import { DeviceDetail } from "./DeviceDetail";
+import { RulesTab } from "./rules/RulesTab";
 import { NodeDetail } from "./NodeDetail";
 import { DeviceRow, NetworkRow } from "./NetworkRow";
 import { buildNodeRoster } from "./nodeRoster";
@@ -83,7 +84,7 @@ function NetworkPanelBody({
   selectedKey: string | null;
   onSelect: (entryKey: string | null) => void;
 }) {
-  const [tab, setTab] = useState<"connected" | "nodes">("connected");
+  const [tab, setTab] = useState<"connected" | "nodes" | "rules">("connected");
   useOuiRegistry();
   // Radio temps come from the historian, not the router directly. Poll only
   // while the panel is mounted (i.e. the Network panel is open).
@@ -97,7 +98,12 @@ function NetworkPanelBody({
   const nowMs = useNow(30_000);
   // Both halves of what pausing needs, so the list can name whichever is missing.
   const { status: cloudStatus } = useCloudAccount(true);
-  const needsAccount = cloudStatus !== "loading" && cloudStatus !== "ready";
+  // Two different questions. Whether pausing works at all is the same condition
+  // the control itself uses, so the list explains exactly what it hides. Whether
+  // to say "sign in" is narrower: a session that is held but unreachable is a
+  // connection fault, and sending someone to sign in over one is a dead end.
+  const accountUnavailable = cloudStatus !== "loading" && cloudStatus !== "ready";
+  const needsAccount = cloudStatus === "not-connected";
   const needsSelfDevice = selfDeviceHost() !== null && selfResolved && !selfIdentified(self);
 
   /** The LAN is silent and the account is answering in its place. */
@@ -126,6 +132,22 @@ function NetworkPanelBody({
       );
     });
   }, [devices, self, network.ratesAtRoster]);
+
+  // A limit can be set on any device the recorder holds a record for, not only
+  // the ones answering right now: an absent device's cycle still rolls and its
+  // pause still releases. Live is a tag on the row, decided here because only
+  // this view knows which devices the router is currently reporting.
+  const liveKeys = new Set(devices.map((client) => usageKey(client.clientId, client.macAddress)));
+  const meterCandidates = (totals ?? []).map((total) => {
+    const clientKey = usageKey(total.clientId, total.macAddress);
+    return {
+      clientKey,
+      name: total.name?.trim() || total.macAddress,
+      macAddress: total.macAddress,
+      active: liveKeys.has(clientKey),
+      lastSeenMs: total.lastSeenMs,
+    };
+  });
 
   if (network.routerReachable === null) {
     return <Loading message='Contacting the router…' />;
@@ -194,6 +216,7 @@ function NetworkPanelBody({
         }
         isThisDevice={matchesSelf(selected, self)}
         viewerIdentified={selfIdentified(self)}
+        meterCandidates={meterCandidates}
         onRename={network.renameClient}
       />
     );
@@ -210,6 +233,7 @@ function NetworkPanelBody({
         options={[
           { value: "connected", label: <TabLabel text='Connected' count={devices.length} /> },
           { value: "nodes", label: <TabLabel text='Nodes' count={nodes.length} /> },
+          { value: "rules", label: <TabLabel text='Rules' /> },
         ]}
       />
 
@@ -254,22 +278,22 @@ function NetworkPanelBody({
               />
             ))}
           </ListSection>
-          {(needsAccount || needsSelfDevice) && (
+          {(accountUnavailable || needsSelfDevice) && (
             <Callout tone='info' iconSeverity='warn' className='mt-2.5'>
               Pause feature disabled! To enable,{" "}
-              {needsAccount && (
+              {accountUnavailable && (
                 <>
                   <button
                     type='button'
                     className={inlineLinkButton}
                     onClick={() => requestPanel("account")}
                   >
-                    sign in
+                    {needsAccount ? "sign in" : "reconnect"}
                   </button>{" "}
                   to your Starlink account
                 </>
               )}
-              {needsAccount && needsSelfDevice && " and "}
+              {accountUnavailable && needsSelfDevice && " and "}
               {needsSelfDevice && (
                 <>
                   pick the current device you are using under app&rsquo;s{" "}
@@ -325,11 +349,14 @@ function NetworkPanelBody({
           ))}
         </ListSection>
       )}
+
+      {tab === "rules" && <RulesTab candidates={meterCandidates} />}
     </div>
   );
 }
 
-function TabLabel({ text, count }: { text: string; count: number }) {
+function TabLabel({ text, count }: { text: string; count?: number }) {
+  if (count === undefined) return text;
   return (
     <>
       {text} <span className='ml-[3px] font-mono text-[11px] tabular-nums opacity-60'>{count}</span>

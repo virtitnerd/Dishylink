@@ -23,7 +23,9 @@
   --color-popover-foreground: var(--ink);
   --color-primary: var(--ink);
   --color-primary-foreground: var(--page);
-  --color-secondary: var(--surface-raised);
+  --color-fill-raised: color-mix(in srgb, var(--ink) 8%, var(--surface));
+  --color-fill-hover: color-mix(in srgb, var(--ink) 4%, transparent);
+  --color-secondary: var(--color-fill-raised);
   --color-secondary-foreground: var(--ink);
   --color-muted: var(--grid-dot);
   --color-muted-foreground: var(--ink-muted);
@@ -198,6 +200,19 @@ body {
   }
   55% {
     box-shadow: 0 0 0 5px transparent;
+  }
+}
+
+/* The PAUSED glyph + wifi mark breathing on the meter ring: a soft dim and back,
+   not Tailwind's animate-pulse fade-to-half — a device that is paused, not
+   loading. */
+@keyframes paused-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
   }
 }
 

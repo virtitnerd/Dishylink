@@ -6,9 +6,18 @@
 // exactly as the dev proxy relies on.
 
 import { app, safeStorage, BrowserWindow, session } from "electron";
-import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+  appendFileSync,
+  mkdirSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { createCloudHandler } from "../cloud/starlinkCloudHandler";
+import { resilientFetch } from "../cloud/resilientFetch";
 import { DishClient, ROUTER_LAN_HANDLE_URL } from "../core/dishClient";
 import { prepareDishUpdate } from "../core/dishConfigUpdate";
 import type { DishUpdate } from "../core/dishConfigUpdate";
@@ -30,23 +39,31 @@ const LOGIN_PARTITION = "persist:starlink-login";
 
 let handler: ReturnType<typeof createCloudHandler> | null = null;
 let cookieFile = "";
+/** Set when the session file is shared with another process, which writes it as
+ *  plain text. safeStorage is keyed to this app, so an encrypted one is private
+ *  to it and nothing else on the machine could read the session out of it. */
+let sharedCookieFile = false;
 
+/** null, never "", so every reader agrees on what "no session" looks like. */
 function readCookie(): string | null {
   try {
     if (!existsSync(cookieFile)) return null;
     const stored = readFileSync(cookieFile);
-    return safeStorage.isEncryptionAvailable()
-      ? safeStorage.decryptString(stored)
-      : stored.toString("utf8");
+    const cookie =
+      !sharedCookieFile && safeStorage.isEncryptionAvailable()
+        ? safeStorage.decryptString(stored)
+        : stored.toString("utf8");
+    return cookie.trim() || null;
   } catch {
     return null;
   }
 }
 
 function writeCookie(cookie: string): void {
-  const data = safeStorage.isEncryptionAvailable()
-    ? safeStorage.encryptString(cookie)
-    : Buffer.from(cookie, "utf8");
+  const data =
+    !sharedCookieFile && safeStorage.isEncryptionAvailable()
+      ? safeStorage.encryptString(cookie)
+      : Buffer.from(cookie, "utf8");
   writeFileSync(cookieFile, data);
 }
 
@@ -58,9 +75,58 @@ function clearCookie(): void {
   }
 }
 
+/** Roughly a day of calls at this app's rate, and small enough to paste. */
+const TIMING_LOG_MAX_BYTES = 256 * 1024;
+
+/** One line per cloud call into logs/cloud-timing.log. A write that fails here
+ *  reports a deadline with no record of which call spent it, and the phase is
+ *  the whole diagnosis. */
+const timedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = String(input instanceof Request ? input.url : input);
+  const name = url.includes("auth-rp")
+    ? "auth"
+    : url.includes("service-lines")
+      ? "service-lines"
+      : url.includes("telemetry")
+        ? "telemetry"
+        : url.includes("Handle")
+          ? "gateway"
+          : // Path only: a query string carries the session, and an account or
+            // service-line number in the path is the customer's, not a route name.
+            new URL(url).pathname.replace(/\/(AST|SL)-[\w-]+/gi, "/…");
+  const started = Date.now();
+  const note = (outcome: string) => {
+    try {
+      const directory = app.getPath("logs");
+      mkdirSync(directory, { recursive: true });
+      const file = join(directory, "cloud-timing.log");
+      // Truncated rather than rotated: this is a rolling window for diagnosing
+      // the call in front of you, not a record worth keeping.
+      if ((statSync(file, { throwIfNoEntry: false })?.size ?? 0) > TIMING_LOG_MAX_BYTES)
+        rmSync(file);
+      appendFileSync(
+        file,
+        `[${new Date().toISOString()}] ${name} ${Date.now() - started}ms ${outcome}\n`,
+      );
+    } catch {
+      // Nowhere to write it is not worth failing the request over.
+    }
+  };
+  try {
+    const response = await resilientFetch(input, init);
+    note(`HTTP ${response.status}`);
+    return response;
+  } catch (error) {
+    const held = error as { name?: string; code?: string; cause?: { code?: string } };
+    note(`FAILED ${held.cause?.code ?? held.code ?? held.name ?? "unknown"}`);
+    throw error;
+  }
+}) as typeof fetch;
+
 /** Create the cloud client once, after the app is ready (the data path needs it). */
-export function startCloud(rendererRoot: string): void {
-  cookieFile = join(app.getPath("userData"), "starlink-session.bin");
+export function startCloud(rendererRoot: string, sessionFile?: string): void {
+  cookieFile = sessionFile ?? join(app.getPath("userData"), "starlink-session.bin");
+  sharedCookieFile = sessionFile !== undefined;
   const protosetPath = app.isPackaged
     ? join(rendererRoot, "dish.protoset")
     : join(app.getAppPath(), "public/dish.protoset");
@@ -74,6 +140,7 @@ export function startCloud(rendererRoot: string): void {
       protosetBytes: new Uint8Array(readFileSync(protosetPath)),
     }));
   handler = createCloudHandler({
+    fetch: timedFetch,
     readCookie,
     writeCookie,
     clearCookie,
@@ -100,6 +167,27 @@ export function startCloud(rendererRoot: string): void {
     readRouterConfig: async (targetId, callGateway) =>
       readRouterWifiConfig(await loadRouter(), targetId, callGateway),
   });
+}
+
+/**
+ * Pause or unpause a device from main, with no window involved.
+ *
+ * The recorder calls this when a device spends its data allowance, which happens
+ * whether or not anyone is looking. It goes through the same queued, validated
+ * path the renderer's own pause takes, so the two cannot build a client-config
+ * write from stale snapshots of each other.
+ */
+/** Whether an account session exists for that write to go out on. */
+export function accountSignedIn(): boolean {
+  return handler !== null && readCookie() !== null;
+}
+
+export async function pauseDevice(clientId: number, paused: boolean): Promise<void> {
+  if (!handler) throw new Error("Cloud not started");
+  const { status, body } = await handler.updateClient({ kind: "pause", clientId, paused });
+  if (status === 200) return;
+  const message = (body as { message?: string })?.message ?? `HTTP ${status}`;
+  throw new Error(status === 428 ? "No Starlink account connected" : message);
 }
 
 function json(status: number, body: unknown): Response {

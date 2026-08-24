@@ -280,6 +280,12 @@ class StarlinkClient:
         """Reboots the dish. Causes a brief (~1 min) outage."""
         return self._to_dict(self._handle("reboot", "SpaceX.API.Device.RebootRequest"))
 
+    def factory_reset(self) -> dict:
+        """Wipes the dish back to its shipped state. Not reversible."""
+        return self._to_dict(
+            self._handle("factory_reset", "SpaceX.API.Device.FactoryResetRequest")
+        )
+
     def start_speedtest(self, duration_s: int = 18) -> dict:
         return self._to_dict(
             self._handle("start_speedtest", "SpaceX.API.Device.StartSpeedtestRequest", duration_s=duration_s, send_telemetry=False)
@@ -332,6 +338,12 @@ class StarlinkClient:
     def reboot_router(self) -> dict:
         """Reboots the router (not the dish). Causes a brief WiFi outage; the dish itself keeps running."""
         return self._to_dict(self._handle_router("reboot", "SpaceX.API.Device.RebootRequest"))
+
+    def factory_reset_router(self) -> dict:
+        """Wipes the router's WiFi name, password, and every setting. Not reversible."""
+        return self._to_dict(
+            self._handle_router("factory_reset", "SpaceX.API.Device.FactoryResetRequest")
+        )
 
     def set_client_given_name(self, mac_address: str, given_name: str) -> dict:
         client_name = self._message_class_cached("SpaceX.API.Device.ClientName")(mac_address=mac_address, given_name=given_name)

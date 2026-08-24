@@ -414,6 +414,13 @@ def api_reboot():
     return JSONResponse(safe(client.reboot))
 
 
+@app.post("/api/factory-reset")
+def api_factory_reset():
+    """Wipes the dish back to its shipped state -- not reversible. Confirmed client-side first."""
+    client = get_client()
+    return JSONResponse(safe(client.factory_reset))
+
+
 @app.post("/api/obstruction-map/clear")
 def api_obstruction_map_clear():
     """Wipes the dish's learned obstruction map. Confirmed client-side before this fires."""
@@ -688,6 +695,13 @@ def api_router_reboot():
     """Reboots the router (not the dish) -- confirmed client-side before this fires."""
     client = get_client()
     return JSONResponse(safe(client.reboot_router))
+
+
+@app.post("/api/router/factory-reset")
+def api_router_factory_reset():
+    """Wipes the router's WiFi name, password, and every setting -- not reversible."""
+    client = get_client()
+    return JSONResponse(safe(client.factory_reset_router))
 
 
 class ClientNamePayload(BaseModel):

@@ -3,10 +3,19 @@
 // otherwise stand in their place.
 
 import { expect, test, vi } from "vitest";
-import { render } from "vitest-browser-react";
+import { render as baseRender } from "vitest-browser-react";
 import { NetworkPanel } from "./NetworkPanel";
 import type { RouterNetwork } from "../../hooks/useRouterNetwork";
 import { setCloudHost } from "../../lib/cloudHost";
+import { TooltipProvider } from "../ui/tooltip";
+
+// A metered device's row renders a Tooltip (the usage glyph), which throws
+// outside a TooltipProvider -- every render in this file goes through here so
+// no individual call site has to remember to wrap it.
+function render(...args: Parameters<typeof baseRender>) {
+  const [ui, options] = args;
+  return baseRender(ui, { wrapper: TooltipProvider, ...options });
+}
 
 vi.mock("../../lib/routerStatusFeed", () => ({ subscribeRouterStatus: () => () => {} }));
 

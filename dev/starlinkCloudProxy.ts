@@ -12,6 +12,7 @@ import { resolve } from "node:path";
 import type { Plugin } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createCloudHandler } from "../cloud/starlinkCloudHandler.ts";
+import { resilientFetch } from "../cloud/resilientFetch.ts";
 import { DishClient, ROUTER_LAN_HANDLE_URL, setApiBase } from "../core/dishClient.ts";
 import {
   buildRouterConfigRequest,
@@ -30,9 +31,10 @@ import { localNetworkIdentity } from "../core/hostNetworkIdentity.ts";
 
 const COOKIE_FILE = resolve(process.cwd(), ".starlink-cookie");
 
+/** null, never "", so every reader agrees on what "no session" looks like. */
 function readCookie(): string | null {
   try {
-    return readFileSync(COOKIE_FILE, "utf8").trim();
+    return readFileSync(COOKIE_FILE, "utf8").trim() || null;
   } catch {
     return null;
   }
@@ -104,6 +106,7 @@ export function starlinkCloudProxy(): Plugin {
           protosetBytes: protosetBytes(),
         }));
       const handler = createCloudHandler({
+        fetch: resilientFetch,
         readCookie,
         writeCookie,
         clearCookie,
@@ -135,6 +138,7 @@ export function starlinkCloudProxy(): Plugin {
         readRouterConfig: async (targetId, callGateway) =>
           readRouterWifiConfig(await loadRouter(), targetId, callGateway),
       });
+
       server.middlewares.use(async (req: IncomingMessage, res: ServerResponse, next) => {
         const url = req.url ?? "";
         if (!url.startsWith("/cloud/")) return next();

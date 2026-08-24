@@ -77,6 +77,10 @@ export default defineConfig(({ command }) => ({
           // Extension store tests that need real IndexedDB run in the browser
           // project below, not this Node one.
           exclude: [...configDefaults.exclude, "extension/**/*.browser.test.ts"],
+          // Own group: this project's maxWorkers differs from the browser
+          // project's, and Vitest requires distinct groupOrder whenever that's
+          // the case.
+          sequence: { groupOrder: 0 },
         },
       },
       // Component tests in real Chromium, not jsdom: they render canvas and WebGL
@@ -88,6 +92,12 @@ export default defineConfig(({ command }) => ({
           name: "browser",
           include: ["src/**/*.test.tsx", "extension/**/*.browser.test.ts"],
           setupFiles: ["./src/test-setup.ts"],
+          // Each worker holds its own real Chromium context; too many
+          // rendering canvas/WebGL at once starve each other and fail at
+          // random. Capped below the default worker count for a
+          // deterministic run, at the cost of wall-clock time.
+          maxWorkers: 3,
+          sequence: { groupOrder: 1 },
           browser: {
             enabled: true,
             provider: playwright(),
@@ -138,6 +148,9 @@ export default defineConfig(({ command }) => ({
       // build) -- replaces dishylink's own historian/grpc-web proxy as the real
       // data source; see core/dishClient.ts. 127.0.0.1, not localhost: Node
       // resolves localhost verbatim, often to ::1 first, which nothing answers.
+      // NOT replaced by upstream's "embed the recorder in the dev server" plugin
+      // (dev/starlinkCloudProxy.ts) -- this fork's /api is always the Python
+      // backend, dev or packaged, so that embed is deliberately not adopted.
       "/api": {
         target: "http://127.0.0.1:8787/api",
         changeOrigin: true,

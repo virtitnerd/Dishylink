@@ -13,11 +13,17 @@ import { Badge } from "../ui/badge";
 import { DeviceFactsList } from "./DeviceFactsList";
 import { DeviceNameEditor, RenameButton } from "./DeviceNameEditor";
 import { DeviceSignalIcon } from "../../assets/icons/DeviceSignalIcon";
+import { MeterIcon } from "../../assets/icons/MeterIcon";
+import { METER_INDICATOR_COLOR, meterIndicatorForRule } from "./rules/meterIndicator";
 import { DeviceThroughput } from "./DeviceThroughput";
+import { DataMeterDialog } from "./rules/DataMeterDialog";
+import type { MemberCandidate } from "./rules/allowanceTerms";
+import { useDataMeter } from "../../hooks/useDataMeter";
 import { buildDeviceFacts } from "./deviceFacts";
 import { deviceRowSubtitle } from "./deviceRowSubtitle";
 import { displayName, pauseSettleTimeoutMs, signalQuality } from "./networkFormat";
 import { Button } from "../ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { SpinLoader } from "../loaders/SpinLoader";
 import {
   AccountRequiredError,
@@ -47,9 +53,12 @@ export function DeviceDetail({
   upstreamName,
   isThisDevice,
   viewerIdentified,
+  meterCandidates,
   onRename,
 }: {
   client: WifiClientJson;
+  /** Every device a limit set here could be extended to cover. */
+  meterCandidates: MemberCandidate[];
   /** Live per-MAC rates from the hook's byte-delta tracker. */
   rates: Map<string, ThroughputRates>;
   /** Whether that tracker is still being fed. It runs on the LAN, so a roster
@@ -76,6 +85,7 @@ export function DeviceDetail({
   onRename: (clientId: number, givenName: string) => Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
+  const [editingMeter, setEditingMeter] = useState(false);
   const [pendingPaused, setPendingPaused] = useState<boolean | null>(null);
   const [confirmingPause, setConfirmingPause] = useState(false);
   const [pauseError, setPauseError] = useState<Error | null>(null);
@@ -86,11 +96,25 @@ export function DeviceDetail({
   if (pendingPaused !== null && paused === pendingPaused) setPendingPaused(null);
   const pauseBusy = pendingPaused !== null && paused !== pendingPaused;
   const { status: cloudStatus } = useCloudAccount(true);
+  const meter = useDataMeter(
+    client.macAddress ? usageKey(client.clientId, client.macAddress) : null,
+  );
+  // A pause a rule is holding, as against one someone set by hand: the row in the
+  // list already tells the two apart, and the detail behind it has to agree.
+  const heldByRule = meter.rules.some((rule) => rule.holding);
   const showPauseControl = clientPauseControlAvailable({
     clientId: client.clientId,
     isThisDevice,
     viewerIdentified,
     cloudConnected: cloudStatus === "ready",
+  });
+  // The recorder counts a limit with or without an account, so only the pause
+  // write needs one.
+  const showMeterControl = clientPauseControlAvailable({
+    clientId: client.clientId,
+    isThisDevice,
+    viewerIdentified,
+    cloudConnected: true,
   });
 
   useEffect(() => {
@@ -175,9 +199,28 @@ export function DeviceDetail({
               {client.clientId}
             </span>
           )}
-          {paused && <Badge className='mt-1'>Paused</Badge>}
+          {paused && <Badge className='mt-1'>{heldByRule ? "Paused · limit" : "Paused"}</Badge>}
         </div>
-        <div className='flex justify-end'>
+        <div className='flex items-center justify-end gap-1.5'>
+          {showMeterControl && client.macAddress && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant='ghost'
+                  size='sm'
+                  aria-label='Data limit'
+                  className='cursor-pointer px-2'
+                  onClick={() => setEditingMeter(true)}
+                >
+                  <MeterIcon
+                    className={`size-[21px] ${meter.rule ? METER_INDICATOR_COLOR[meterIndicatorForRule(meter.rule)] : ""}`}
+                    active={meter.rule !== null}
+                  />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side='top'>Data limit</TooltipContent>
+            </Tooltip>
+          )}
           {showPauseControl && (
             <Button
               variant={paused ? "outline" : "secondary"}
@@ -249,6 +292,18 @@ export function DeviceDetail({
             pauseError.message
           )}
         </div>
+      )}
+
+      {client.macAddress && (
+        <DataMeterDialog
+          meter={meter}
+          clientKey={usageKey(client.clientId, client.macAddress)}
+          deviceName={name}
+          macAddress={client.macAddress}
+          candidates={meterCandidates}
+          open={editingMeter}
+          onOpenChange={setEditingMeter}
+        />
       )}
 
       {editing && (

@@ -44,6 +44,8 @@ import { routerAddressHost } from "../../lib/routerAddressHost";
 import { applyRouterConfigUpdate } from "../../lib/routerConfigUpdate";
 import { useCloudAccount, useCloudRouterSubnet } from "../../hooks/useCloudAccount";
 import { useRouterAddressState } from "../../hooks/useRouterAddress";
+import { routerPresence } from "@core/routerPresence";
+import type { DishStatusJson } from "@core/dishClient";
 import {
   SUBNET_OPTIONS,
   addRouterNetwork,
@@ -236,12 +238,14 @@ function controllerBypassed(account: CloudAccount | null): boolean | null {
 
 export function RouterSettingsTab({
   wifiConfig,
+  dishStatus,
   routerReachable,
   viaAccount,
   unreachable,
   onConfigChanged,
 }: {
   wifiConfig: WifiNetworkConfigJson | null;
+  dishStatus: DishStatusJson | null;
   routerReachable: boolean | null;
   /** Whether `wifiConfig` was read through the account because the LAN could not
    *  serve it. What it says is the same either way; what still cannot be done
@@ -267,6 +271,10 @@ export function RouterSettingsTab({
   // once the account is the only way to reach it), so the control is disabled
   // up front rather than failing at the moment Save is pressed.
   const [addresses, setAddresses] = useRouterAddressState();
+  // A store still on its first read says nothing either way, and the retry loop
+  // keeps flicking it back through "loading", so the first answer is remembered.
+  const [accountAnswered, setAccountAnswered] = useState(false);
+  if (!accountAnswered && cloudAccount.status !== "loading") setAccountAnswered(true);
   const lanSubnet = wifiConfig?.networks?.[0]?.ipv4 ?? null;
   // The account is asked only when the router itself cannot answer, which costs
   // a round trip to Starlink for something the LAN gives away for free.
@@ -471,14 +479,6 @@ export function RouterSettingsTab({
       {/* Branch on the diagnosis rather than on `routerReachable` again: it is
           derived from that same flag, so this cannot render an empty callout. */}
       {unreachable && <Callout tone='error'>{unreachable.message}</Callout>}
-      {/* Populated sections under that error would otherwise read as if the
-          router were answering after all. */}
-      {viaAccount && (
-        <Callout tone='info' className='mt-2.5'>
-          What follows is read through your Starlink account. Anything that dials the router
-          directly — a reboot — stays unavailable until it answers here.
-        </Callout>
-      )}
 
       {configKnown && (
         <>
@@ -995,12 +995,36 @@ export function RouterSettingsTab({
             : "Unavailable until the router answers"
         }
         buttonLabel='Reboot'
-        confirmLabel='Yes, reboot router'
+        slideLabel='Slide to reboot router'
+        confirmLabel='Reboot router'
         disabled={!answering}
         onRun={async () => {
           const routerClient = await DishClient.load("router");
           await routerClient.reboot();
           return "Reboot sent — the router is restarting.";
+        }}
+      />
+      <DangerAction
+        title='Factory reset router'
+        caption={
+          answering || cloudConnected
+            ? "Wipes the WiFi name, password and every router setting. Not reversible."
+            : "Needs the router on this network, or your Starlink account"
+        }
+        buttonLabel='Factory reset'
+        slideLabel='Slide to factory reset the router'
+        confirmLabel='Factory reset router'
+        warning='Factory reset will clear your WiFi network name, password, and other settings. This will interrupt your service until you set it up again.'
+        disabled={!answering && !cloudConnected}
+        onRun={async () => {
+          // A bypassed router is off the LAN, which is exactly when a reset is
+          // wanted: the account reaches it there and nothing local does.
+          if (!answering) {
+            await applyRouterConfigUpdate({ kind: "factoryReset" });
+            return "Factory reset sent through your Starlink account — the router is wiping and restarting.";
+          }
+          await (await DishClient.load("router")).factoryReset();
+          return "Factory reset sent — the router is wiping and restarting.";
         }}
       />
       {addresses && (
@@ -1047,7 +1071,10 @@ export function RouterSettingsTab({
       <BypassSection
         reported={bypassed}
         routerAnswering={answering}
-        disabled={!cloudConnected}
+        dishPresence={routerPresence(dishStatus)}
+        // A failed read is not an absent session, and bypass is what fails reads.
+        disabled={!accountAnswered || cloudAccount.status === "not-connected"}
+        accountAnswering={cloudConnected}
         onReload={cloudAccount.reload}
         onSave={async (enabled) => {
           await applyRouterConfigUpdate({ kind: "bypass", enabled });

@@ -27,6 +27,12 @@ is on the Starlink network itself — changes are verified against real hardware
   See `backend/starlink_cloud.py`'s `ApplicationRejectedError` /
   `core/routerWifiConfigUpdate.ts`'s `stripBssid`/`stripForNewAuth`, and `LOCAL-API.md`'s
   "Authenticated cloud router writes" section.
+- **Bypass mode has no account- or app-side undo.** Starlink's own support documentation names a
+  factory reset via the router's physical reset button as the way out, full stop — confirmed
+  2026-08-24 against their Help Center, which contradicts an earlier upstream code comment this
+  fork briefly trusted. `BypassSection.tsx`'s copy says this plainly; do not reintroduce language
+  implying the account path can turn bypass back off, even though the *write* to enable it rides
+  the cloud gateway same as everything else here.
 
 ## Working with this user
 
@@ -34,7 +40,12 @@ is on the Starlink network itself — changes are verified against real hardware
   editing. When the user says "leave this for now", stop editing entirely until redirected.
 - **If the user's message contains a question, answer it fully before any further tool calls.**
   Deferring the answer while continuing to edit counts as ignoring them.
+- **Run every check CI runs, before committing, not after pushing.** `npm run typecheck`,
+  `npm run lint`, `npm test`, and `npx prettier --check` over the files the commit touches — a
+  full-tree prettier check reports a pre-existing backlog that is not yours to fix.
 - Never `git add -A` or `git stash`; commit only the files you yourself changed.
+- No attribution trailers in commit messages, PR bodies or issue bodies: no `Claude-Session`,
+  no `claude.ai/code` link, no `Co-Authored-By`, no "Generated with".
 
 ## Process facts
 
@@ -52,7 +63,7 @@ is on the Starlink network itself — changes are verified against real hardware
 - **`backend/server.py` does not hot-reload.** Restart it (`cd backend && ./stop.sh && ./start.sh`)
   after editing any `.py` file there before checking whether a fix landed — `server.log` and
   `server.pid` track the background process `start.sh` launches. The web dev harness's `npm run
-dev` proxies `/api/*` to this server (`vite.config.ts`), so a stale server silently serves stale
+  dev` proxies `/api/*` to this server (`vite.config.ts`), so a stale server silently serves stale
   data to the browser too, not just to the standalone deployment.
 - The user's pasted starlink.com session lives in `.starlink-cookie` at the repo root when written
   by `dev/starlinkCloudProxy.ts` (web dev harness), or under `backend/cache/starlink-cookie` when
