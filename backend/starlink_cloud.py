@@ -48,6 +48,15 @@ ACCESS_V1_STRIP_RE = re.compile(r"Starlink\.Com\.Access\.V1=[^;]*;?")
 
 NOT_CONNECTED = (428, {"error": "not_connected", "message": "An authorized account is required — sign in to use this feature."})
 
+# Answered wherever a router has to be named, so every surface says the same
+# waitable thing rather than reporting an outage.
+NO_CONTROLLER = (503, {
+    "error": "router_not_reported",
+    "message": "Starlink hasn't reported your router yet, so there's nothing to send this to. Try again once it checks in.",
+})
+
+DEVICE_RETRY_DELAY_S = 5.0
+
 
 class SessionExpiredError(Exception):
     pass
@@ -55,6 +64,22 @@ class SessionExpiredError(Exception):
 
 class UpstreamError(Exception):
     pass
+
+
+class ControllerUnknownError(Exception):
+    """The account has not named a router this write could target. Nothing is
+    wrong with the session or the connection: the telemetry feed is
+    momentarily empty, and it fills in again on its own."""
+
+
+class DispatchFailure(Exception):
+    """A failure raised by the write itself rather than by anything leading up
+    to it -- carried on the error because a session miss retries the whole
+    attempt, and a flag set by an earlier one would still be standing."""
+
+    def __init__(self, reason: BaseException):
+        super().__init__("router config write failed")
+        self.reason = reason
 
 
 # -- session persistence ------------------------------------------------------
@@ -82,16 +107,21 @@ _cached_cookie: str | None = None
 _cached_at = 0.0
 _cached_ids: dict[str, str] | None = None
 _cached_ids_at = 0.0
+_cached_controller_id: str | None = None
+_cached_controller_id_at = 0.0
 _refresh_lock = threading.Lock()
 _mutation_lock = threading.Lock()
 
 
 def _forget_session() -> None:
     global _cached_cookie, _cached_at, _cached_ids, _cached_ids_at
+    global _cached_controller_id, _cached_controller_id_at
     _cached_cookie = None
     _cached_at = 0.0
     _cached_ids = None
     _cached_ids_at = 0.0
+    _cached_controller_id = None
+    _cached_controller_id_at = 0.0
 
 
 def _http(url: str, *, cookie: str | None = None, method: str = "GET", json_body: Any = None, timeout: float = DEVICE_CALL_TIMEOUT_S):
@@ -278,6 +308,109 @@ def _resolve_ids(cookie: str) -> dict[str, str]:
     return _cached_ids
 
 
+def _remember_controller(telemetry: Any, last_resort: bool = False) -> bool:
+    """Caches the controller named by any telemetry reply, so a write prepared
+    over a network it is about to take down needs one round trip fewer.
+
+    `last_resort` is only for a caller about to write: a lone router in a
+    reply is the controller when someone asked for it right then, but a
+    bypass flip can drop the controller out of telemetry for a moment, and a
+    background read landing there would cache the mesh node -- which is never
+    the controller and answers DEVICE_NOT_CONNECTED -- for the whole life of
+    the cache."""
+    global _cached_controller_id, _cached_controller_id_at
+    routers = [
+        (device_id, dev)
+        for device_id, dev in device_telemetry_from(telemetry).items()
+        if dev.get("kind") == "router"
+    ]
+    controller = next((r for r in routers if r[1].get("hops") == 0), None)
+    if controller is None and last_resort and len(routers) == 1:
+        controller = routers[0]
+    if controller is None:
+        return False
+    _cached_controller_id = controller[0]
+    _cached_controller_id_at = time.time()
+    return True
+
+
+def _resolve_controller_id(cookie: str, cached: bool = True) -> str:
+    """The router to configure, named by the account rather than by the LAN.
+
+    A mesh node reports as a router too, so the id cannot simply be "the one
+    router on the account" -- this kit has two. `WifiHopsFromController` is
+    what separates them: the controller is zero hops from itself, and every
+    node sits behind it. Sourcing this from telemetry rather than the local
+    router is the whole reason a bypassed kit, which answers nothing on the
+    LAN, can still be configured.
+
+    `cached=False` is for a write: the id is learned from a telemetry
+    snapshot, and the snapshot taken during a flip can omit the controller and
+    name only a mesh node, which is never connected. Cached, that answer
+    outlives the flip and refuses every write behind it."""
+    global _cached_controller_id, _cached_controller_id_at
+    if cached and _cached_controller_id and time.time() - _cached_controller_id_at < IDS_TTL_S:
+        return _cached_controller_id
+    ids = _resolve_ids(cookie)
+    telemetry = _api_post("/device-data/cache/v1/telemetry", cookie, {"accountNumber": ids["acc"]})
+    if not _remember_controller(telemetry, last_resort=True):
+        raise ControllerUnknownError()
+    return _cached_controller_id  # type: ignore[return-value]
+
+
+def _with_router_gateway(run: Callable[[str, Callable[[bytes], bytes]], Any]) -> Any:
+    """Run one bounded read against the account's controller: resolve the
+    target, hand the callback a gateway bound to a fresh token, and let a
+    session miss heal the way every other call here does."""
+
+    def attempt(cookie: str) -> Any:
+        target_id = _resolve_controller_id(cookie)
+        return run(target_id, lambda request_bytes: _grpc_web_unary_call(DEVICE_HANDLE, request_bytes, cookie))
+
+    return _with_fresh_cookie(attempt)
+
+
+class _RouterReader:
+    """Resolves once whether this router can be read over the LAN right now,
+    then serves every read a prepare step needs from wherever that resolved
+    to -- LAN when reachable, the account's cloud gateway otherwise (needed
+    for a kit in bypass mode, which has no reachable router on the LAN at
+    all). Resolved once per prepare call rather than once per read, so a
+    request built from two reads is never a mix of a LAN snapshot and a cloud
+    one."""
+
+    def __init__(self, cookie: str):
+        try:
+            client = get_client()
+            status = client.get_router_status()
+            target_id = (status.get("deviceInfo") or {}).get("id")
+            if not target_id:
+                raise StarlinkError("Starlink router identity is unavailable")
+            self._client = client
+            self._target_id = target_id
+            self._call_gateway: Callable[[bytes], bytes] | None = None
+        except StarlinkError:
+            self._client = None
+            self._target_id = _resolve_controller_id(cookie)
+            self._call_gateway = lambda request_bytes: _grpc_web_unary_call(DEVICE_HANDLE, request_bytes, cookie)
+
+    @property
+    def target_id(self) -> str:
+        return self._target_id
+
+    def wifi_config(self) -> dict:
+        if self._client is not None:
+            return self._client.get_wifi_config().get("wifiConfig", {})
+        assert self._call_gateway is not None
+        return read_router_wifi_config(self._target_id, self._call_gateway) or {}
+
+    def wifi_clients(self) -> list[dict]:
+        if self._client is not None:
+            return self._client.get_wifi_clients().get("clients") or []
+        assert self._call_gateway is not None
+        return read_router_clients(self._target_id, self._call_gateway)
+
+
 # -- session connect/disconnect + read routes --------------------------------
 
 def connect(cookie: str) -> tuple[int, dict]:
@@ -301,8 +434,48 @@ def disconnect() -> tuple[int, dict]:
     return 200, {"ok": True}
 
 
+# Local-first reads for the three router-* cloud routes: this process can
+# usually reach the router directly, and a LAN read costs nothing a cloud
+# round trip doesn't also cost -- so it's tried first, with no cloud session
+# required at all when it answers. Only a router this LAN cannot reach (not on
+# its network, or genuinely bypassed) falls through to the account.
+_ROUTER_READS: dict[str, tuple[Callable[[], Any], Callable[[str, Callable[[bytes], bytes]], Any]]] = {
+    "/cloud/router-subnet": (
+        lambda: {"subnet": (lambda ns: (ns[0].get("ipv4") if ns and isinstance(ns[0].get("ipv4"), str) else None))(
+            get_client().get_wifi_config().get("wifiConfig", {}).get("networks") or []
+        )},
+        lambda target_id, call_gateway: {"subnet": read_current_subnet(target_id, call_gateway)},
+    ),
+    "/cloud/router-clients": (
+        lambda: {"clients": get_client().get_wifi_clients().get("clients") or []},
+        lambda target_id, call_gateway: {"clients": read_router_clients(target_id, call_gateway)},
+    ),
+    "/cloud/router-config": (
+        lambda: {"wifiConfig": get_client().get_wifi_config().get("wifiConfig", {})},
+        lambda target_id, call_gateway: {"wifiConfig": read_router_wifi_config(target_id, call_gateway)},
+    ),
+}
+
+
 def handle(route: str) -> tuple[int, dict]:
     """route is the path without query, e.g. "/cloud/account"."""
+    if route in _ROUTER_READS:
+        local_read, cloud_read = _ROUTER_READS[route]
+        try:
+            return 200, local_read()
+        except StarlinkError:
+            pass
+        if not read_cookie():
+            return NOT_CONNECTED
+        try:
+            return 200, _with_router_gateway(cloud_read)
+        except SessionExpiredError:
+            return NOT_CONNECTED
+        except ControllerUnknownError:
+            return NO_CONTROLLER
+        except Exception as exc:  # noqa: BLE001 -- API boundary
+            return 502, {"error": "upstream_failed", "message": str(exc)}
+
     if not read_cookie():
         return NOT_CONNECTED
     try:
@@ -337,6 +510,8 @@ def handle(route: str) -> tuple[int, dict]:
         return 404, {"error": "unknown_cloud_route", "route": route}
     except SessionExpiredError:
         return NOT_CONNECTED
+    except ControllerUnknownError:
+        return NO_CONTROLLER
     except Exception as exc:  # noqa: BLE001 -- API boundary
         return 502, {"error": "upstream_failed", "message": str(exc)}
 
@@ -462,18 +637,20 @@ def _redact_passwords(value: Any) -> Any:
     return value
 
 
-def _apply_device_update(prepare_fn: Callable[[dict], dict], update: dict, label: str) -> tuple[int, dict]:
+def _apply_device_update(prepare_fn: Callable[[dict, str], dict], update: dict, label: str) -> tuple[int, dict]:
     if not read_cookie():
         return NOT_CONNECTED
     try:
-        # Keep preparation (a local read) and the corresponding write in one
-        # serialized critical section, so a later mutation can't be built from
-        # a snapshot predating an earlier write -- port of deviceMutationTail.
+        # Keep preparation (a local-or-cloud read) and the corresponding write
+        # in one serialized critical section, so a later mutation can't be
+        # built from a snapshot predating an earlier write -- port of
+        # deviceMutationTail. Preparation needs a cookie now too (the fallback
+        # read rides the same account gateway the write does), so it moves
+        # inside the fresh-cookie retry rather than running ahead of it.
         with _mutation_lock:
-            request_json = prepare_fn(update)
-            request_bytes = _build_request_bytes(request_json)
-
             def run(cookie: str) -> None:
+                request_json = prepare_fn(update, cookie)
+                request_bytes = _build_request_bytes(request_json)
                 try:
                     response_bytes = _grpc_web_unary_call(DEVICE_HANDLE, request_bytes, cookie)
                 except GrpcWebCallError as exc:
@@ -575,25 +752,27 @@ def _client_is_host(client: dict) -> bool:
     return any((v6 or "").replace("::ffff:", "").lower() in local for v6 in client.get("ipv6Addresses") or [])
 
 
-def _prepare_client_update(update: dict) -> dict:
-    client = get_client()
-    config = client.get_wifi_config().get("wifiConfig", {})
-    status = client.get_router_status()
-    target_id = (status.get("deviceInfo") or {}).get("id")
-    if not target_id:
-        raise ValueError("Starlink router identity is unavailable")
+def _prepare_client_update(update: dict, cookie: str) -> dict:
+    """Reads the router directly when this process can reach it, and falls
+    back to the account's cloud gateway otherwise -- the fallback is what
+    lets a device be paused or renamed on a kit in bypass mode, which has no
+    reachable router on the LAN at all, or from a machine that isn't on that
+    network in the first place."""
+    reader = _RouterReader(cookie)
+    config = reader.wifi_config()
+    target_id = reader.target_id
 
     if update["kind"] == "rename":
         client_id = update["clientId"]
         saved = any(c.get("clientId") == client_id for c in (config.get("clientConfigs") or []))
         live_client = None
         if not saved:
-            clients = client.get_wifi_clients().get("clients") or []
+            clients = reader.wifi_clients()
             live_client = next((c for c in clients if c.get("clientId") == client_id), None)
         return _build_router_rename_request(target_id, config, client_id, update["givenName"], live_client)
 
     client_id = update["clientId"]
-    clients = client.get_wifi_clients().get("clients") or []
+    clients = reader.wifi_clients()
     live_client = next((c for c in clients if c.get("clientId") == client_id), None)
     if not live_client:
         raise ValueError("Device is no longer connected to the router")
@@ -698,12 +877,15 @@ def _passthrough_network(network: dict) -> dict:
     }
 
 
-def _prepare_wifi_config_update(update: dict) -> dict:
-    client = get_client()
-    status = client.get_router_status()
-    target_id = (status.get("deviceInfo") or {}).get("id")
-    if not target_id:
-        raise ValueError("Starlink router identity is unavailable")
+def _prepare_wifi_config_update(update: dict, cookie: str) -> dict:
+    """Reads the router directly when this process can reach it, and falls
+    back to the account's cloud gateway otherwise -- see _RouterReader. A kind
+    that names one flat field (dns/bypassMode/routerAdvanced) needs no read at
+    all, so those never actually touch the fallback; every other kind rewrites
+    a shared block (networks/meshConfigs), which the fallback lets a
+    LAN-unreachable router keep serving."""
+    reader = _RouterReader(cookie)
+    target_id = reader.target_id
     kind = update["kind"]
 
     if kind == "dns":
@@ -715,7 +897,7 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         return _wifi_config_request_for(target_id, {"bypassMode": update["enabled"]})
 
     if kind == "contentFiltering":
-        config = client.get_wifi_config().get("wifiConfig", {})
+        config = reader.wifi_config()
         networks = config.get("networks") or []
         if not networks:
             raise ValueError("router has no configured networks to filter")
@@ -733,7 +915,7 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         # RF_5GHZ each exist once per network. The auth_* fields are a oneof,
         # so every variant the read brought back is stripped before setting
         # exactly the one this write wants (see _auth_fields_for).
-        config = client.get_wifi_config().get("wifiConfig", {})
+        config = reader.wifi_config()
         matched = False
         new_networks = []
         for network in config.get("networks") or []:
@@ -760,7 +942,7 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         return _wifi_config_request_for(target_id, {"networks": new_networks})
 
     if kind == "networkSettings":
-        config = client.get_wifi_config().get("wifiConfig", {})
+        config = reader.wifi_config()
         matched = False
         new_networks = []
         for network in config.get("networks") or []:
@@ -783,7 +965,7 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         return _wifi_config_request_for(target_id, {"networks": new_networks})
 
     if kind == "addNetwork":
-        config = client.get_wifi_config().get("wifiConfig", {})
+        config = reader.wifi_config()
         existing = config.get("networks") or []
         domain = _next_domain(existing)
         vlan = _next_vlan(existing)
@@ -809,7 +991,7 @@ def _prepare_wifi_config_update(update: dict) -> dict:
         )
 
     if kind == "deleteNetwork":
-        config = client.get_wifi_config().get("wifiConfig", {})
+        config = reader.wifi_config()
         existing = config.get("networks") or []
         if existing and existing[0].get("domain") == update["networkDomain"]:
             raise ValueError("the first network can't be deleted, only modified")
@@ -834,7 +1016,7 @@ def _prepare_wifi_config_update(update: dict) -> dict:
     if kind == "meshTrust":
         # meshConfigs is a map keyed by deviceId -- read-modify-write the one
         # entry, same reason networks[] needs it.
-        config = client.get_wifi_config().get("wifiConfig", {})
+        config = reader.wifi_config()
         existing = config.get("meshConfigs") or {}
         node = existing.get(update["deviceId"])
         if not node:
@@ -887,6 +1069,318 @@ def _prepare_dish_update(update: dict) -> dict:
             raise ValueError("invalid dish target id")
         return {"targetId": target_id, "dishClearObstructionMap": {}}
     raise ValueError("unhandled update kind")
+
+
+# -- router config writes over the cloud gateway (port of core/routerConfigUpdate.ts) --
+# The router merges by apply flag, so naming one field changes that field and
+# nothing else -- customDns and bypass are sent on their own, with no read
+# beforehand. A subnet change is the exception: it travels inside the
+# `networks` block, which carries the SSIDs and passphrases too, so the
+# current block has to be read and handed back nearly intact.
+#
+# Unlike the WifiConfig kinds above (read via the local router), every read
+# and write here rides the cloud gateway. That is what makes these usable on
+# the setups that want them most: a kit in bypass mode has no reachable
+# router on the local network at all, and its target comes from the account.
+
+MAX_NAMESERVERS = 4
+MIN_PASSPHRASE = 8
+MAX_PASSPHRASE = 63
+PASSPHRASE_AUTH_KEYS = ("authWpa2", "authWpa3", "authWpa2Wpa3")
+
+
+def _is_ipv4(candidate: str) -> bool:
+    octets = candidate.split(".")
+    if len(octets) != 4:
+        return False
+    for octet in octets:
+        if not octet.isdigit() or not (1 <= len(octet) <= 3):
+            return False
+        if len(octet) > 1 and octet.startswith("0"):
+            return False
+        if int(octet) > 255:
+            return False
+    return True
+
+
+def _expand_ipv6(address: str) -> list[str] | None:
+    bare = address.split("%")[0].strip().lower()
+    if bare == "" or "." in bare:
+        return None
+    halves = bare.split("::")
+    if len(halves) > 2:
+        return None
+
+    def groups_of(part: str) -> list[str]:
+        return part.split(":") if part else []
+
+    left = groups_of(halves[0])
+    right = groups_of(halves[1]) if len(halves) == 2 else []
+    full = [*left, *(["0"] * (8 - len(left) - len(right))), *right] if len(halves) == 2 else left
+    if len(full) != 8 or not all(re.fullmatch(r"[0-9a-f]{1,4}", g) for g in full):
+        return None
+    return full
+
+
+def normalize_ip_address(value: str) -> str | None:
+    """An address as typed, reduced to the canonical form the write is built
+    from, or None when it is not an address the router could forward to."""
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+    unbracketed = (
+        trimmed[1:-1].strip() if trimmed.startswith("[") and trimmed.endswith("]") else trimmed
+    )
+    if _is_ipv4(unbracketed):
+        return unbracketed
+    without_zone = unbracketed.split("%")[0]
+    if _expand_ipv6(without_zone) is not None:
+        return without_zone.lower()
+    return None
+
+
+def normalize_nameservers(nameservers: list[str]) -> list[str] | None:
+    """The addresses as they will be sent, or None when any of them is not an
+    address the router could forward to. Order is kept: the first is the
+    primary."""
+    if len(nameservers) > MAX_NAMESERVERS:
+        return None
+    normalized: list[str] = []
+    for candidate in nameservers:
+        address = normalize_ip_address(candidate)
+        if not address:
+            return None
+        if address not in normalized:
+            normalized.append(address)
+    return normalized
+
+
+def subnet_refusal(subnet: str, password: str) -> str | None:
+    """Why a subnet change cannot be sent, or None when it can."""
+    if subnet not in SUBNET_OPTIONS:
+        return "unsupported subnet"
+    if len(password) < MIN_PASSPHRASE or len(password) > MAX_PASSPHRASE:
+        return f"Password must contain {MIN_PASSPHRASE} to {MAX_PASSPHRASE} characters"
+    return None
+
+
+def _build_subnet_networks(networks: list[dict], subnet: str, password: str) -> list[dict]:
+    """The `networks` block to send for a subnet change, built from what the
+    router currently reports. `bssid` and `ifaceName` are router-assigned:
+    carrying them back makes the firmware discard the entire message without
+    an error. The passphrase reads back masked, so every auth block holding
+    one must be overwritten with the real value."""
+    out: list[dict] = []
+    for index, network in enumerate(networks):
+        nn = dict(network)
+        if index == 0:
+            nn["ipv4"] = subnet
+        new_bss = []
+        for bss in network.get("basicServiceSets") or []:
+            b = {k: v for k, v in bss.items() if k not in ("bssid", "ifaceName")}
+            for key in PASSPHRASE_AUTH_KEYS:
+                auth = b.get(key)
+                if isinstance(auth, dict) and "password" in auth:
+                    b[key] = {**auth, "password": password}
+            new_bss.append(b)
+        nn["basicServiceSets"] = new_bss
+        out.append(nn)
+    return out
+
+
+def _router_config_request_json(target_id: str, update: dict, networks: list[dict]) -> dict:
+    if not target_id.startswith("Router-"):
+        raise ValueError("invalid router target id")
+    kind = update["kind"]
+    if kind == "subnet":
+        refusal = subnet_refusal(update["subnet"], update["password"])
+        if refusal:
+            raise ValueError(refusal)
+        if not networks:
+            raise ValueError("router reported no networks to change")
+        return {
+            "targetId": target_id,
+            "wifiSetConfig": {
+                "wifiConfig": {
+                    "networks": _build_subnet_networks(networks, update["subnet"], update["password"]),
+                    "applyNetworks": True,
+                }
+            },
+        }
+    if kind == "bypass":
+        return {
+            "targetId": target_id,
+            "wifiSetConfig": {"wifiConfig": {"bypassMode": update["enabled"], "applyBypassMode": True}},
+        }
+    # FactoryResetRequest carries no fields.
+    if kind == "factoryReset":
+        return {"targetId": target_id, "factoryReset": {}}
+    nameservers = normalize_nameservers(update["nameservers"])
+    if nameservers is None:
+        raise ValueError("invalid DNS server address")
+    return {
+        "targetId": target_id,
+        "wifiSetConfig": {"wifiConfig": {"nameservers": nameservers, "applyNameservers": True}},
+    }
+
+
+def _decode_response_dict(response_bytes: bytes) -> dict:
+    response = get_client().new_response_message()
+    response.ParseFromString(response_bytes)
+    return json_format.MessageToDict(response, preserving_proto_field_name=False)
+
+
+def read_router_wifi_config(target_id: str, call_gateway: Callable[[bytes], bytes]) -> dict | None:
+    """The router's whole WiFi configuration, over the caller's gateway -- the
+    same block the LAN serves, for a router the local network cannot reach."""
+    reply = _decode_response_dict(call_gateway(_build_request_bytes({"targetId": target_id, "wifiGetConfig": {}})))
+    return (reply.get("wifiGetConfig") or {}).get("wifiConfig")
+
+
+def _read_router_networks(target_id: str, call_gateway: Callable[[bytes], bytes]) -> list[dict]:
+    config = read_router_wifi_config(target_id, call_gateway)
+    return (config or {}).get("networks") or []
+
+
+def _read_current_networks(update: dict, target_id: str, call_gateway: Callable[[bytes], bytes]) -> list[dict]:
+    """Only a subnet change needs the current networks, so every other update
+    skips the round trip. Tried over the LAN first -- the router this process
+    can reach is the controller `target_id` already names, since only the
+    controller answers on the router's own LAN address -- and only over the
+    account's gateway when that fails, which is the case that matters most:
+    a subnet change is exactly the kind of write someone reaches for when the
+    router is already hard to get to."""
+    if update["kind"] != "subnet":
+        return []
+    try:
+        return get_client().get_wifi_config().get("wifiConfig", {}).get("networks") or []
+    except StarlinkError:
+        return _read_router_networks(target_id, call_gateway)
+
+
+def read_current_subnet(target_id: str, call_gateway: Callable[[bytes], bytes]) -> str | None:
+    """The subnet the router is on, over the same gateway the writes use."""
+    networks = _read_router_networks(target_id, call_gateway)
+    if not networks:
+        return None
+    ipv4 = networks[0].get("ipv4")
+    return ipv4 if isinstance(ipv4, str) else None
+
+
+def read_router_clients(target_id: str, call_gateway: Callable[[bytes], bytes]) -> list[dict]:
+    """The devices the router currently reports, over the caller's gateway
+    instead of the LAN -- answers for a router the local network cannot see,
+    and from a machine that is not on that network at all."""
+    reply = _decode_response_dict(call_gateway(_build_request_bytes({"targetId": target_id, "wifiGetClients": {}})))
+    return (reply.get("wifiGetClients") or {}).get("clients") or []
+
+
+def _retries_when_missing(update: dict) -> bool:
+    """Whether a refused write may simply be sent again. A subnet change
+    carries a `networks` block read before the first try, so repeating it
+    would write back a snapshot that is no longer current; the others name
+    one field and nothing else, so sending the same value twice is the same
+    as sending it once."""
+    return update["kind"] in ("bypass", "customDns", "factoryReset")
+
+
+def _send_router_config_update(update: dict) -> tuple[int, dict]:
+    if not read_cookie():
+        return NOT_CONNECTED
+    try:
+        with _mutation_lock:
+            def run(cookie: str) -> None:
+                target_id = _resolve_controller_id(cookie, cached=False)
+
+                def call_gateway(request_bytes: bytes) -> bytes:
+                    return _grpc_web_unary_call(DEVICE_HANDLE, request_bytes, cookie)
+
+                networks = _read_current_networks(update, target_id, call_gateway)
+                request_bytes = _build_request_bytes(_router_config_request_json(target_id, update, networks))
+                try:
+                    call_gateway(request_bytes)
+                except GrpcWebCallError as failure:
+                    if failure.status == 16:
+                        raise SessionExpiredError()
+                    raise DispatchFailure(failure)
+                except (UpstreamError, TimeoutError) as failure:
+                    raise DispatchFailure(failure)
+
+            _with_fresh_cookie(run)
+        return 200, {"ok": True}
+    except SessionExpiredError:
+        return NOT_CONNECTED
+    except ControllerUnknownError:
+        return NO_CONTROLLER
+    except DispatchFailure as wrapped:
+        reason = wrapped.reason
+        # A subnet change and a bypass switch both reconfigure the LAN
+        # carrying them, so a write that takes effect kills its own reply.
+        # Neither is the far end refusing, and only the far end can refuse.
+        severs_own_reply = update["kind"] in ("subnet", "bypass", "factoryReset")
+        if severs_own_reply and not isinstance(reason, GrpcWebCallError):
+            return 200, {"ok": True, "applied": True}
+        if isinstance(reason, TimeoutError):
+            return 504, {
+                "error": "device_call_timeout",
+                "message": "Starlink did not answer the router change in time. Try again.",
+            }
+        body: dict = {"error": "device_call_failed", "message": str(reason)}
+        # The gateway had no session to the router. Nothing was applied and
+        # nothing is wrong with the request, so asking again later is the
+        # only thing that can succeed.
+        if isinstance(reason, GrpcWebCallError) and reason.status == 5:
+            body["deviceUnreachable"] = True
+        return 502, body
+    except TimeoutError:
+        # A write that was never dispatched cannot be the router not answering.
+        return 504, {
+            "error": "prepare_call_timeout",
+            "message": "Starlink didn't answer in time while preparing the change, so nothing was sent. Try again.",
+        }
+    except Exception as exc:  # noqa: BLE001 -- API boundary
+        return 502, {"error": "device_call_failed", "message": str(exc)}
+
+
+def _apply_router_config_update(update: dict) -> tuple[int, dict]:
+    """A device the gateway says it cannot reach, tried once more from
+    nothing. Resending the same bytes cannot help: the target id is already
+    encoded in them, and a target learned during a flip can name a mesh node
+    that is never connected. Only dropping what we learned and building the
+    request again can change the answer."""
+    status, body = _send_router_config_update(update)
+    if not body.get("deviceUnreachable") or not _retries_when_missing(update):
+        return status, body
+    _forget_session()
+    time.sleep(DEVICE_RETRY_DELAY_S)
+    return _send_router_config_update(update)
+
+
+def _valid_router_config(update: dict) -> bool:
+    """The caller names a field and its new value, never protobuf. Anything
+    outside these shapes is refused before the account is touched."""
+    kind = update.get("kind")
+    if kind == "subnet":
+        subnet, password = update.get("subnet"), update.get("password")
+        if not isinstance(subnet, str) or not isinstance(password, str):
+            return False
+        return subnet_refusal(subnet, password) is None
+    if kind == "bypass":
+        return isinstance(update.get("enabled"), bool)
+    if kind == "factoryReset":
+        return True
+    if kind != "customDns":
+        return False
+    nameservers = update.get("nameservers")
+    if not isinstance(nameservers, list) or not all(isinstance(n, str) for n in nameservers):
+        return False
+    return normalize_nameservers(nameservers) is not None
+
+
+def update_router_config(update: dict) -> tuple[int, dict]:
+    if not _valid_router_config(update):
+        return 400, {"error": "bad_request"}
+    return _apply_router_config_update(update)
 
 
 # -- validation (port of validUpdate/validWifiConfigUpdate/validDishUpdate) --

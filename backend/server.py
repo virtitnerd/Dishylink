@@ -817,6 +817,27 @@ def api_cloud_telemetry():
     return JSONResponse(body, status_code=status)
 
 
+# The subnet, roster, and WiFi config the LAN normally serves, sourced from the
+# account instead -- the one path that still answers for a router this network
+# cannot see, or from a machine that isn't on that network at all.
+@app.get("/cloud/router-subnet")
+def api_cloud_router_subnet():
+    status, body = starlink_cloud.handle("/cloud/router-subnet")
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/cloud/router-clients")
+def api_cloud_router_clients():
+    status, body = starlink_cloud.handle("/cloud/router-clients")
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/cloud/router-config")
+def api_cloud_router_config():
+    status, body = starlink_cloud.handle("/cloud/router-config")
+    return JSONResponse(body, status_code=status)
+
+
 @app.post("/cloud/device")
 def api_cloud_device(update: dict[str, Any]):
     status, body = starlink_cloud.update_client(update)
@@ -832,6 +853,15 @@ def api_cloud_wifi_config(update: dict[str, Any]):
 @app.post("/cloud/dish-config")
 def api_cloud_dish_config(update: dict[str, Any]):
     status, body = starlink_cloud.update_dish_config(update)
+    return JSONResponse(body, status_code=status)
+
+
+# customDns / subnet / bypass / factoryReset -- the one write path with any
+# chance of reaching a router bypass has made invisible on the LAN, since it
+# resolves its target and reads/writes entirely through the account.
+@app.post("/cloud/router-config")
+def api_cloud_router_config_update(update: dict[str, Any]):
+    status, body = starlink_cloud.update_router_config(update)
     return JSONResponse(body, status_code=status)
 
 
