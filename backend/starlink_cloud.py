@@ -1188,7 +1188,23 @@ def _build_subnet_networks(networks: list[dict], subnet: str, password: str) -> 
     return out
 
 
-def _router_config_request_json(target_id: str, update: dict, networks: list[dict]) -> dict:
+def mesh_name_refusal(display_name: str) -> str | None:
+    return "Name cannot be empty" if display_name.strip() == "" else None
+
+
+def _build_mesh_configs(mesh_configs: dict, device_id: str, display_name: str) -> dict:
+    if device_id not in mesh_configs:
+        raise ValueError("router does not know this mesh node")
+    rebuilt: dict = {}
+    for node_id, node in mesh_configs.items():
+        # incarnation is router-assigned; echoing it back can make the firmware
+        # discard the write, as a stale bssid does in the networks block.
+        kept = {k: v for k, v in node.items() if k != "incarnation"}
+        rebuilt[node_id] = {**kept, "displayName": display_name} if node_id == device_id else kept
+    return rebuilt
+
+
+def _router_config_request_json(target_id: str, update: dict, context: dict) -> dict:
     if not target_id.startswith("Router-"):
         raise ValueError("invalid router target id")
     kind = update["kind"]
@@ -1196,6 +1212,7 @@ def _router_config_request_json(target_id: str, update: dict, networks: list[dic
         refusal = subnet_refusal(update["subnet"], update["password"])
         if refusal:
             raise ValueError(refusal)
+        networks = context.get("networks") or []
         if not networks:
             raise ValueError("router reported no networks to change")
         return {
@@ -1206,6 +1223,17 @@ def _router_config_request_json(target_id: str, update: dict, networks: list[dic
                     "applyNetworks": True,
                 }
             },
+        }
+    if kind == "meshName":
+        refusal = mesh_name_refusal(update["displayName"])
+        if refusal:
+            raise ValueError(refusal)
+        mesh_configs = _build_mesh_configs(
+            context.get("meshConfigs") or {}, update["deviceId"], update["displayName"].strip()
+        )
+        return {
+            "targetId": target_id,
+            "wifiSetConfig": {"wifiConfig": {"meshConfigs": mesh_configs, "applyMeshConfigs": True}},
         }
     if kind == "bypass":
         return {
@@ -1242,20 +1270,27 @@ def _read_router_networks(target_id: str, call_gateway: Callable[[bytes], bytes]
     return (config or {}).get("networks") or []
 
 
-def _read_current_networks(update: dict, target_id: str, call_gateway: Callable[[bytes], bytes]) -> list[dict]:
-    """Only a subnet change needs the current networks, so every other update
-    skips the round trip. Tried over the LAN first -- the router this process
-    can reach is the controller `target_id` already names, since only the
-    controller answers on the router's own LAN address -- and only over the
-    account's gateway when that fails, which is the case that matters most:
-    a subnet change is exactly the kind of write someone reaches for when the
-    router is already hard to get to."""
-    if update["kind"] != "subnet":
-        return []
-    try:
-        return get_client().get_wifi_config().get("wifiConfig", {}).get("networks") or []
-    except StarlinkError:
-        return _read_router_networks(target_id, call_gateway)
+def _read_router_config_context(update: dict, target_id: str, call_gateway: Callable[[bytes], bytes]) -> dict:
+    """The current state a write must be built from -- only a subnet change or
+    a mesh rename needs it, so every other kind skips the round trip. Tried
+    over the LAN first -- the router this process can reach is the controller
+    `target_id` already names, since only the controller answers on the
+    router's own LAN address -- and only over the account's gateway when that
+    fails, which is the case that matters most: these are exactly the kinds of
+    write someone reaches for when the router is already hard to get to."""
+    if update["kind"] == "subnet":
+        try:
+            networks = get_client().get_wifi_config().get("wifiConfig", {}).get("networks") or []
+        except StarlinkError:
+            networks = _read_router_networks(target_id, call_gateway)
+        return {"networks": networks}
+    if update["kind"] == "meshName":
+        try:
+            config = get_client().get_wifi_config().get("wifiConfig", {})
+        except StarlinkError:
+            config = read_router_wifi_config(target_id, call_gateway) or {}
+        return {"meshConfigs": config.get("meshConfigs") or {}}
+    return {}
 
 
 def read_current_subnet(target_id: str, call_gateway: Callable[[bytes], bytes]) -> str | None:
@@ -1295,8 +1330,8 @@ def _send_router_config_update(update: dict) -> tuple[int, dict]:
                 def call_gateway(request_bytes: bytes) -> bytes:
                     return _grpc_web_unary_call(DEVICE_HANDLE, request_bytes, cookie)
 
-                networks = _read_current_networks(update, target_id, call_gateway)
-                request_bytes = _build_request_bytes(_router_config_request_json(target_id, update, networks))
+                context = _read_router_config_context(update, target_id, call_gateway)
+                request_bytes = _build_request_bytes(_router_config_request_json(target_id, update, context))
                 try:
                     call_gateway(request_bytes)
                 except GrpcWebCallError as failure:
@@ -1367,6 +1402,14 @@ def _valid_router_config(update: dict) -> bool:
         return subnet_refusal(subnet, password) is None
     if kind == "bypass":
         return isinstance(update.get("enabled"), bool)
+    if kind == "meshName":
+        device_id = update.get("deviceId")
+        if not isinstance(device_id, str) or not device_id.startswith("Router-"):
+            return False
+        display_name = update.get("displayName")
+        if not isinstance(display_name, str):
+            return False
+        return mesh_name_refusal(display_name) is None
     if kind == "factoryReset":
         return True
     if kind != "customDns":
