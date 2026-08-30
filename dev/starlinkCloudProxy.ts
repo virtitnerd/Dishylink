@@ -16,7 +16,7 @@ import { resilientFetch } from "../cloud/resilientFetch.ts";
 import { DishClient, ROUTER_LAN_HANDLE_URL, setApiBase } from "../core/dishClient.ts";
 import {
   buildRouterConfigRequest,
-  readCurrentNetworks,
+  readRouterConfigContext,
   readCurrentSubnet,
   readRouterWifiConfig,
   type RouterConfigUpdate,
@@ -93,6 +93,11 @@ export function starlinkCloudProxy(): Plugin {
       // backend. Scoped to this process only: the browser's own DishClient
       // instances (everything the rest of the UI uses) keep the relative
       // default, proxied through Vite's own /api entry in vite.config.ts.
+      // NOT replaced by upstream's "embed the recorder in the dev server"
+      // plugin (HISTORIAN_EMBED / collector/historian.mts serving /api/*
+      // directly) -- this fork's /api is always the Python backend, dev or
+      // packaged, so that embed is deliberately not adopted, upstream commit
+      // after upstream commit.
       setApiBase("http://127.0.0.1:8787/api");
       let routerPromise: Promise<DishClient> | null = null;
       let dishPromise: Promise<DishClient> | null = null;
@@ -128,8 +133,8 @@ export function starlinkCloudProxy(): Plugin {
         // kit whose router answers nothing on the LAN.
         prepareRouterConfigUpdate: async (update, targetId, callGateway) => {
           const client = await loadRouter();
-          const networks = await readCurrentNetworks(update, client, targetId, callGateway);
-          return client.encodeRequest(buildRouterConfigRequest(targetId, update, networks));
+          const context = await readRouterConfigContext(update, client, targetId, callGateway);
+          return client.encodeRequest(buildRouterConfigRequest(targetId, update, context));
         },
         readRouterSubnet: async (targetId, callGateway) =>
           readCurrentSubnet(await loadRouter(), targetId, callGateway),

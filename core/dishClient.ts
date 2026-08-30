@@ -392,7 +392,7 @@ export type VhtBandwidth =
   | "VHT_BANDWIDTH_80_PLUS_80_MHZ";
 
 /** A decoded Device.Response, narrowed to the one field decodeResponse's caller
- *  reads today -- see routerConfigUpdate.ts's readCurrentNetworks/readCurrentSubnet. */
+ *  reads today -- see routerConfigUpdate.ts's readRouterConfigContext/readCurrentSubnet. */
 export interface DishResponseJson {
   wifiGetConfig?: { wifiConfig?: WifiNetworkConfigJson };
 }

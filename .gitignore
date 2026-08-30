@@ -25,6 +25,7 @@ backend/cache/
 
 # Claude Code's local settings/session state — machine-specific, not shared config.
 .claude/
+CLAUDE.local.md
 
 # Working notes and throwaway probe scripts. Local to whoever is mid-task.
 HANDOFF.md

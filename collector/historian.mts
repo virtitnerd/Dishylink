@@ -26,6 +26,7 @@ import {
 } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { networkInterfaces } from "node:os";
+import { identityFromEnv } from "../core/hostNetworkIdentity.ts";
 import { join, resolve } from "node:path";
 import { createFileRegistry, fromBinary, toJson, type DescMessage } from "@bufbuild/protobuf";
 import { FileDescriptorSetSchema } from "@bufbuild/protobuf/wkt";
@@ -47,6 +48,9 @@ import {
 } from "../core/telemetry.ts";
 import { EnergyStore, foldSamplesToMinutes, type MinuteBucket } from "./energyStore.mts";
 import { energyRangeBounds, RANGES, summarizeEnergy, type Range } from "../core/energySummary.ts";
+import { LatencyStore, type LatencyMinuteBucket } from "./latencyStore.mts";
+import { foldSamplesToLatencyMinutes } from "../core/latencyBuckets.ts";
+import { summarizeLatency } from "../core/latencySummary.ts";
 import { ThermalStore } from "./thermalStore.mts";
 import { EventStore } from "./eventStore.mts";
 import { ClientStore, type ClientReading } from "./clientStore.mts";
@@ -56,6 +60,7 @@ import { ClientTotalsStore } from "./clientTotals.mts";
 import { MeterStore } from "./meterStore.mts";
 import { DeviceGroupStore } from "./groupStore.mts";
 import { CollectorBusyError } from "./collectorLock.mts";
+import { isLocalOrigin } from "./localOrigin.mts";
 import {
   announcementSubject,
   announcesAsGroup,
@@ -105,6 +110,7 @@ export function setRouterAddressReader(reader: () => string | null): void {
 const DATA_DIR = process.env.HISTORIAN_DATA_DIR ?? resolve("collector/data");
 const PROTOSET_PATH = process.env.HISTORIAN_PROTOSET ?? resolve("public/dish.protoset");
 const DATA_FILE = join(DATA_DIR, "energy.ndjson");
+const LATENCY_FILE = join(DATA_DIR, "latency.ndjson");
 const SAMPLES_SNAPSHOT_FILE = join(DATA_DIR, "samples.json");
 const THERMAL_FILE = join(DATA_DIR, "thermal.ndjson");
 const EVENTS_FILE = join(DATA_DIR, "events.ndjson");
@@ -157,11 +163,13 @@ const ROUTER_PATH = "/SpaceX.API.Device.Device/Handle";
 const ROUTER_URL_OVERRIDE = process.env.ROUTER_URL ?? null;
 
 const routerOrigins = createRouterOrigins(
-  () =>
-    Object.values(networkInterfaces())
+  () => [
+    ...(identityFromEnv()?.ipAddresses ?? []),
+    ...Object.values(networkInterfaces())
       .flat()
       .filter((entry) => entry && entry.family === "IPv6" && !entry.internal)
       .map((entry) => entry!.address),
+  ],
   () => readConfiguredRouterAddress(),
 );
 
@@ -825,6 +833,7 @@ async function getClientReadings(): Promise<ClientReading[]> {
 }
 
 const store = new EnergyStore(DATA_FILE);
+const latencyStore = new LatencyStore(LATENCY_FILE);
 // Compaction also runs on construction; repeat daily for a historian that stays
 // up for months at a stretch.
 const COMPACT_EVERY_MS = 24 * 3_600_000;
@@ -966,6 +975,12 @@ let latestRadio: { readings: RadioStatReading[]; atMs: number } | null = null;
 // ring on the very next poll, so a restart loses nothing — the durable energy
 // log holds only minutes already finalized, gated by lastWrittenMinute.
 const openMinuteBuckets = new Map<number, MinuteBucket>();
+
+// The minutes seen but not yet finalized for the latency histogram store: the
+// in-progress minute at the head of the ring, replaced every poll with the
+// authoritative recompute from the buffer. RAM-only on purpose, parallel to
+// openMinuteBuckets above; the durable latency log holds only finalized minutes.
+const openLatencyBuckets = new Map<number, LatencyMinuteBucket>();
 
 // Rolling full-resolution window served to the frontend so page reloads (and
 // historian restarts, via the snapshot file) never reset the charts.
@@ -1408,10 +1423,16 @@ async function poll(): Promise<void> {
     window,
   );
   const perMinute = foldSamplesToMinutes(window.samples);
+  // Fold the same window's latency into per-minute histogram buckets so day/week
+  // quality can be summarised without the 6h raw-sample window.
+  const perLatencyMinute = foldSamplesToLatencyMinutes(window.samples);
 
   // Replace (not accumulate) so re-seeing a minute across overlapping polls is idempotent.
   for (const [minute, bucket] of perMinute) {
     if (minute > store.lastWrittenMinute) openMinuteBuckets.set(minute, bucket);
+  }
+  for (const [minute, bucket] of perLatencyMinute) {
+    if (minute > latencyStore.lastWrittenMinute) openLatencyBuckets.set(minute, bucket);
   }
 
   const currentMinute = Math.floor(now / 60_000) * 60;
@@ -1421,6 +1442,13 @@ async function poll(): Promise<void> {
   for (const minute of completed) {
     store.append(openMinuteBuckets.get(minute)!);
     openMinuteBuckets.delete(minute);
+  }
+  const latencyCompleted = [...openLatencyBuckets.keys()]
+    .filter((minute) => minute < currentMinute)
+    .sort((a, b) => a - b);
+  for (const minute of latencyCompleted) {
+    latencyStore.append(openLatencyBuckets.get(minute)!);
+    openLatencyBuckets.delete(minute);
   }
   if (completed.length > 0) {
     const newest = new Date(store.lastWrittenMinute * 1000).toLocaleTimeString();
@@ -1444,31 +1472,17 @@ function summarize(range: Range, now: Date) {
   return summarizeEnergy(bucketsInRange(startSec, endSec), range, now);
 }
 
-/**
- * Whether a request's `Origin` is this machine or the LAN — the dashboard is
- * reached both at localhost and, from a phone, at the host's private address, so
- * both have to pass. A missing Origin is a non-browser client (curl, a script),
- * which is not the drive-by case this guards.
- */
-function isLocalOrigin(origin?: string): boolean {
-  if (!origin) return true;
-  let hostname: string;
-  try {
-    hostname = new URL(origin).hostname.replace(/^\[|\]$/g, "");
-  } catch {
-    return false;
+function latencyBucketsInRange(startSec: number, endSec: number): LatencyMinuteBucket[] {
+  const merged = latencyStore.readRange(startSec, endSec);
+  for (const bucket of openLatencyBuckets.values()) {
+    if (bucket.minute >= startSec && bucket.minute < endSec) merged.push(bucket);
   }
-  if (hostname === "localhost" || hostname === "::1" || /^127\./.test(hostname)) return true;
-  // A name with no dot is a bare LAN hostname; a public site always has one.
-  if (!hostname.includes(".")) return true;
-  if (/\.(local|internal|home\.arpa|ts\.net)$/.test(hostname)) return true;
-  // RFC1918 private ranges.
-  if (/^10\./.test(hostname) || /^192\.168\./.test(hostname)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true;
-  // Tailscale and other CGNAT (100.64.0.0/10), plus link-local and IPv6 ULA.
-  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(hostname)) return true;
-  if (/^169\.254\./.test(hostname)) return true;
-  return /^f[cd][0-9a-f]{2}:/i.test(hostname);
+  return merged;
+}
+
+function summarizeLatencyRange(range: Range, now: Date) {
+  const { startSec, endSec } = energyRangeBounds(range, now);
+  return summarizeLatency(latencyBucketsInRange(startSec, endSec), range, now);
 }
 
 /** Whether a request was addressed to this machine by a loopback name. */
@@ -1509,6 +1523,16 @@ export function handleRequest(request: IncomingMessage, response: ServerResponse
     const range: Range = rangeParam && RANGES.includes(rangeParam) ? rangeParam : "today";
     response.setHeader("Content-Type", "application/json");
     response.end(JSON.stringify(summarize(range, new Date())));
+    return;
+  }
+  // Latency-quality summaries over the persisted per-minute histogram store:
+  // p95/p99/jitter/packet-loss and a 0–100 score, for the day/week ranges the
+  // 6h raw-sample window cannot reach.
+  if (url.pathname === "/api/latency") {
+    const rangeParam = url.searchParams.get("range") as Range | null;
+    const range: Range = rangeParam && RANGES.includes(rangeParam) ? rangeParam : "today";
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify(summarizeLatencyRange(range, new Date())));
     return;
   }
   // Full-resolution sample window for chart backfill after a page reload.
@@ -1827,13 +1851,25 @@ export function handleRequest(request: IncomingMessage, response: ServerResponse
 // dir, not the HTTP port — the embedded host never opens a port, so the port never
 // guarded it. The pidfile is reclaimed when its recorded owner is gone, so a crash
 // (which cannot run the release) does not wedge the next start.
+//
+// globalThis, not module-scope state or a PID compare: Vite's SSR restart can
+// re-evaluate this module within one process, and this must survive that.
+const CLAIM_SENTINEL = Symbol.for("dishylink.historian.dataDirClaim");
+
 function claimDataDir(): void {
   mkdirSync(DATA_DIR, { recursive: true });
+  if ((globalThis as Record<symbol, unknown>)[CLAIM_SENTINEL] === DATA_DIR) {
+    refuseToStart(
+      `this process already owns ${DATA_DIR} — refusing to start a second writer in the same process`,
+      true,
+    );
+  }
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const fd = openSync(LOCK_FILE, "wx");
       writeSync(fd, String(process.pid));
       closeSync(fd);
+      (globalThis as Record<symbol, unknown>)[CLAIM_SENTINEL] = DATA_DIR;
       return;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -1948,6 +1984,11 @@ export function start(): void {
     const folded = store.compact();
     if (folded > 0)
       console.log(`[historian] folded ${folded} minute(s) from past years into monthly summaries`);
+    const latencyFolded = latencyStore.compact();
+    if (latencyFolded > 0)
+      console.log(
+        `[historian] folded ${latencyFolded} latency minute(s) from past years into monthly summaries`,
+      );
   }, COMPACT_EVERY_MS);
   // The per-device log keeps only six hours, so it cannot wait for the daily sweep.
   setInterval(() => {

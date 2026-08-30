@@ -17,6 +17,7 @@ import {
 import type { DishConfigJson } from "../core/dishClient";
 import type { DishUpdate } from "../core/dishConfigUpdate";
 import {
+  meshNameRefusal,
   normalizeNameservers,
   subnetRefusal,
   type RouterConfigUpdate,
@@ -628,7 +629,14 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
         },
       };
     }
-    writeCookie(trimmed);
+    try {
+      writeCookie(trimmed);
+    } catch (error) {
+      return {
+        status: 500,
+        body: { error: "cookie_store_failed", message: (error as Error).message },
+      };
+    }
     forgetSession();
     try {
       await withFreshCookie((c) => resolveIds(c));
@@ -1151,6 +1159,12 @@ export function createCloudHandler(options: CloudHandlerOptions = {}) {
       return subnetRefusal(update.subnet, update.password) === null;
     }
     if (update?.kind === "bypass") return typeof update.enabled === "boolean";
+    if (update?.kind === "meshName") {
+      if (typeof update.deviceId !== "string" || !update.deviceId.startsWith("Router-"))
+        return false;
+      if (typeof update.displayName !== "string") return false;
+      return meshNameRefusal(update.displayName) === null;
+    }
     if (update?.kind === "factoryReset") return true;
     if (update?.kind !== "customDns") return false;
     if (!Array.isArray(update.nameservers)) return false;

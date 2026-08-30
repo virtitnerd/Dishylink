@@ -13,7 +13,7 @@ is on the Starlink network itself — changes are verified against real hardware
   clients on current firmware. The official app gets its cloud data through an authenticated
   `api.starlink.com` session, not the LAN.
 - The router is a small embedded box and has rebooted under ordinary load: **never add a new
-  poll against it without the user's explicit approval.** Reuse replies already being fetched —
+  poll against it without explicit approval.** Reuse replies already being fetched —
   `routerStatusFeed` in the browser, the 5s status poll in the recorder.
 - **Every `WifiConfig` write's `basicServiceSets[]` entries need exactly one of `bssid` or an
   auth field (`authWpa2`/`authWpa3`/`authWpa2Wpa3`/`authOpen`), never both, never neither.**
@@ -34,7 +34,7 @@ is on the Starlink network itself — changes are verified against real hardware
   implying the account path can turn bypass back off, even though the *write* to enable it rides
   the cloud gateway same as everything else here.
 
-## Working with this user
+## CI
 
 - **Findings before code.** Report what you found and the plan, then wait for approval before
   editing. When the user says "leave this for now", stop editing entirely until redirected.
@@ -43,6 +43,8 @@ is on the Starlink network itself — changes are verified against real hardware
 - **Run every check CI runs, before committing, not after pushing.** `npm run typecheck`,
   `npm run lint`, `npm test`, and `npx prettier --check` over the files the commit touches — a
   full-tree prettier check reports a pre-existing backlog that is not yours to fix.
+- Tests that open a socket behave differently on the Linux CI runner than on macOS/Windows dev
+  machines, so a green local run is not a guaranteed green CI run.
 - Never `git add -A` or `git stash`; commit only the files you yourself changed.
 - No attribution trailers in commit messages, PR bodies or issue bodies: no `Claude-Session`,
   no `claude.ai/code` link, no `Co-Authored-By`, no "Generated with".

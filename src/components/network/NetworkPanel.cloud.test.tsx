@@ -38,6 +38,7 @@ const network: RouterNetwork = {
   accountRosterError: null,
   wifiConfigViaAccount: false,
   renameClient: async () => {},
+  renameMeshNode: async () => {},
   throughputHistory: new Map(),
   rates: new Map(),
   ratesAtRoster: new Map(),

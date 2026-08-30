@@ -11,6 +11,7 @@ release
 .wxt
 .DS_Store
 .git
+.github
 
 collector/data
 
@@ -30,5 +31,8 @@ backend/cache/
 *.local.md
 
 landing/
+landing/node_modules
+landing/dist
 .wrangler/
 .astro/
+**/.astro
